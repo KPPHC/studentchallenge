@@ -141,147 +141,195 @@
         
         
         <div class="controls">
-            <input type="text" id="prompt" placeholder="Enter prompt for Claude to generate QR code...">
-            <button id="runButton" onclick="runClaude()">Run Claude Code</button>
+            <div class="presets" id="presets" style="display:flex;gap:0.5rem;flex-wrap:wrap;justify-content:center;width:100%;max-width:800px;">
+              <button type="button" class="preset-btn" data-mode="qr" data-id="qr">QR-code</button>
+              <button type="button" class="preset-btn" data-mode="gesture" data-id="gesture">Gesture detection</button>
+              <button type="button" class="preset-btn" data-mode="object" data-id="object">Object detection</button>
+            </div>
+            <input type="text" id="prompt" placeholder="Enter a prompt or choose a preset below...">
+            <button id="runButton" onclick="runGenerate()">Generate</button>
             <div class="spinner" id="spinner"></div>
         </div>
         
         <div id="status"></div>
         
         <div id="qr-container">
-            <h3>Generated QR Code(s)</h3>
+            <h3>Generated Result</h3>
             <div id="qr-images" class="qr-images-grid"></div>
         </div>
     </div>
     
     <script>
-        async function runClaude() {
-            const prompt = document.getElementById('prompt').value;
-            const statusDiv = document.getElementById('status');
-            const qrContainer = document.getElementById('qr-container');
-            const qrImagesDiv = document.getElementById('qr-images');
-            const runButton = document.getElementById('runButton');
-            const spinner = document.getElementById('spinner');
-            
-            if (!prompt) {
-                statusDiv.style.display = 'block';
-                statusDiv.textContent = 'Please enter a prompt';
-                statusDiv.style.background = 'rgba(255, 0, 0, 0.2)';
-                return;
-            }
-            
-            // Reset UI
-            statusDiv.style.display = 'block';
-            statusDiv.textContent = 'Running Claude...';
-            statusDiv.style.background = 'rgba(255, 255, 255, 0.1)';
-            qrContainer.style.display = 'none';
-            qrImagesDiv.innerHTML = '';
-            runButton.disabled = true;
-            spinner.style.display = 'block';
-            
-            try {
-                const response = await fetch('/run-claude', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'text/plain; charset=utf-8'
-                    },
-                    body: prompt
-                });
-                
-                const data = await response.json();
-                
-                if (response.ok) {
-                    statusDiv.textContent = 'Claude finished successfully!';
-                    statusDiv.style.background = 'rgba(0, 255, 0, 0.2)';
-                    
-                    console.log('Claude response data:', data);
+  // -------------------- Presets --------------------
+  const PRESETS = {
+    qr: {
+      mode: 'qr',
+      prompt: "Write a Python script that creates a QR code image with a UUID. Save it as an image file 'qr_code.jpg'. Also save the same UUID into a text file (e.g., 'uuid.txt'). Ensure the script prints a line like: qr_code <UUID> to stdout."
+    },
+    gesture: {
+      mode: 'gesture',
+      prompt: "I will make a thumbs-up gesture. Build a system that captures from the webcam, detects this gesture reliably, and treats it as my verification. The script should print a line like: gesture thumbs_up and also save a JSON result."
+    },
+    object: {
+      mode: 'object',
+      prompt: "I will present an apple to the camera. Build a system that captures from the webcam, detects the apple, and verifies me when it is recognized. The script should print a line like: object apple and also save a JSON result."
+    }
+  };
 
-                    // Display QR codes if any were generated
-                    if (data.qr_codes && data.qr_codes.length > 0) {
-                        // Add "Verify me" button that navigates to /recognize-qr-image
-                        let verifyBtn = document.getElementById('verifyButton');
-                        if (!verifyBtn) {
-                            verifyBtn = document.createElement('button');
-                            verifyBtn.id = 'verifyButton';
-                            verifyBtn.type = 'button';
-                            verifyBtn.textContent = 'Verify me';
-                            verifyBtn.style.marginTop = '0.5rem';
-                            verifyBtn.addEventListener('click', async () => {
-                                statusDiv.style.display = 'block';
-                                statusDiv.textContent = 'Verifying...';
-                                statusDiv.style.background = 'rgba(255, 255, 255, 0.1)';
-                                try {
-                                    const res = await fetch('/recognize-qr-image');
-                                    const result = await res.json();
-                                    if (res.ok && result.verified) {
-                                        statusDiv.textContent = 'Verified!';
-                                        statusDiv.style.background = 'rgba(0, 255, 0, 0.2)';
-                                    } else {
-                                        statusDiv.textContent = 'Error: ' + (result.error || 'Verification failed');
-                                        statusDiv.style.background = 'rgba(255, 0, 0, 0.2)';
-                                    }
-                                } catch (err) {
-                                    statusDiv.textContent = 'Error: ' + err.message;
-                                    statusDiv.style.background = 'rgba(255, 0, 0, 0.2)';
-                                }
-                            });
-                            // Place the button at the bottom of the QR container
-                            qrContainer.appendChild(verifyBtn);
-                        }
-                        // Ensure it is visible when QR codes are present
-                        verifyBtn.style.display = 'inline-block';
-                        
-                        qrContainer.style.display = 'flex';
-                        
-                        data.qr_codes.forEach(filename => {
-                            // Create image element
-                            const img = document.createElement('img');
-                            img.src = `/qr-code/${filename}?t=${Date.now()}`; // Add timestamp to prevent caching
-                            img.className = 'qr-image';
-                            img.alt = 'QR Code';
-                            
-                            // Create container for image and download link
-                            const imgContainer = document.createElement('div');
-                            imgContainer.style.textAlign = 'center';
-                            
-                            // Create download link
-                            const downloadLink = document.createElement('a');
-                            downloadLink.href = `/qr-code/${filename}`;
-                            downloadLink.download = filename;
-                            downloadLink.className = 'download-link';
-                            downloadLink.textContent = `Download ${filename}`;
-                            
-                            imgContainer.appendChild(img);
-                            imgContainer.appendChild(document.createElement('br'));
-                            imgContainer.appendChild(downloadLink);
-                            
-                            qrImagesDiv.appendChild(imgContainer);
-                        });
-                    }
-                    
-                    // Show Claude's output if needed
-                    if (data.output) {
-                        console.log('Claude output:', data.output);
-                    }
-                } else {
-                    statusDiv.textContent = 'Error: ' + (data.error || 'Unknown error');
-                    statusDiv.style.background = 'rgba(255, 0, 0, 0.2)';
-                }
-            } catch(e) {
-                statusDiv.textContent = 'Error: ' + e.message;
-                statusDiv.style.background = 'rgba(255, 0, 0, 0.2)';
-            } finally {
-                runButton.disabled = false;
-                spinner.style.display = 'none';
-            }
-        }
-        
-        // Allow Enter key to submit
-        document.getElementById('prompt').addEventListener('keypress', function(e) {
-            if (e.key === 'Enter' && !document.getElementById('runButton').disabled) {
-                runClaude();
-            }
-        });
-    </script>
+  let selectedMode = 'qr';
+
+  // -------------------- DOM refs --------------------
+  const statusDiv = document.getElementById('status');
+  const qrContainer = document.getElementById('qr-container');
+  const qrImagesDiv = document.getElementById('qr-images');
+  const runButton = document.getElementById('runButton');
+  const spinner = document.getElementById('spinner');
+  const promptInput = document.getElementById('prompt');
+
+  // -------------------- UI helpers --------------------
+  function setStatus(text, color = 'rgba(255, 255, 255, 0.1)') {
+    statusDiv.style.display = 'block';
+    statusDiv.textContent = text;
+    statusDiv.style.background = color;
+  }
+
+  function clearResults() {
+    qrContainer.style.display = 'none';
+    qrImagesDiv.innerHTML = '';
+    const existing = document.getElementById('verifyButton');
+    if (existing) existing.remove();
+  }
+
+  function showQrImages(files) {
+    if (!files || files.length === 0) return;
+    qrContainer.style.display = 'flex';
+    files.forEach(filename => {
+      const img = document.createElement('img');
+      img.src = `/qr-code/${filename}?t=${Date.now()}`;
+      img.className = 'qr-image';
+      img.alt = 'QR Code';
+
+      const imgContainer = document.createElement('div');
+      imgContainer.style.textAlign = 'center';
+
+      const downloadLink = document.createElement('a');
+      downloadLink.href = `/qr-code/${filename}`;
+      downloadLink.download = filename;
+      downloadLink.className = 'download-link';
+      downloadLink.textContent = `Download ${filename}`;
+
+      imgContainer.appendChild(img);
+      imgContainer.appendChild(document.createElement('br'));
+      imgContainer.appendChild(downloadLink);
+      qrImagesDiv.appendChild(imgContainer);
+    });
+  }
+
+  function addVerifyButton(mode) {
+    let verifyBtn = document.getElementById('verifyButton');
+    if (!verifyBtn) {
+      verifyBtn = document.createElement('button');
+      verifyBtn.id = 'verifyButton';
+      verifyBtn.type = 'button';
+      verifyBtn.textContent = 'Verify';
+      verifyBtn.style.marginTop = '0.5rem';
+      verifyBtn.addEventListener('click', () => runValidate(mode));
+      qrContainer.appendChild(verifyBtn);
+    }
+    verifyBtn.style.display = 'inline-block';
+  }
+
+  // -------------------- Preset wiring --------------------
+  document.querySelectorAll('.preset-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = btn.getAttribute('data-id');
+      const preset = PRESETS[id];
+      if (!preset) return;
+      selectedMode = preset.mode;
+      promptInput.value = preset.prompt;
+      setStatus(`Preset selected: ${id}`, 'rgba(255, 255, 255, 0.1)');
+    });
+  });
+
+  // -------------------- Actions --------------------
+  async function runGenerate() {
+    const prompt = promptInput.value.trim();
+    if (!prompt) {
+      setStatus('Please enter a prompt or choose a preset', 'rgba(255, 0, 0, 0.2)');
+      return;
+    }
+
+    // Reset UI
+    setStatus('Generating with Claude...', 'rgba(255, 255, 255, 0.1)');
+    clearResults();
+    runButton.disabled = true;
+    spinner.style.display = 'block';
+
+    try {
+      const response = await fetch('/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+        body: prompt
+      });
+      const data = await response.json();
+
+      if (!response.ok) {
+        setStatus('Error: ' + (data.error || 'Unknown error'), 'rgba(255, 0, 0, 0.2)');
+        return;
+      }
+
+      if (data.errors && data.errors.length) {
+        setStatus('Completed with warnings: ' + data.errors.join('; '));
+      } else {
+        setStatus('Generation finished successfully!', 'rgba(0, 255, 0, 0.2)');
+      }
+
+      // Render results
+      const files = (data.data && data.data.qr_codes) ? data.data.qr_codes : [];
+      if (files.length) {
+        showQrImages(files);
+        addVerifyButton(selectedMode);
+      }
+
+      if (data.data && data.data.text) {
+        // Append text result under status
+        const p = document.createElement('p');
+        p.style.color = '#fff';
+        p.textContent = data.data.text;
+        statusDiv.insertAdjacentElement('afterend', p);
+      }
+
+      console.log('Claude output:', data.output_text);
+    } catch (e) {
+      setStatus('Error: ' + e.message, 'rgba(255, 0, 0, 0.2)');
+    } finally {
+      runButton.disabled = false;
+      spinner.style.display = 'none';
+    }
+  }
+
+  async function runValidate(mode) {
+    try {
+      setStatus('Validating...', 'rgba(255, 255, 255, 0.1)');
+      const res = await fetch(`/validate?mode=${encodeURIComponent(mode)}`);
+      const result = await res.json();
+      if (res.ok && result.verified) {
+        setStatus('Verified!', 'rgba(0, 255, 0, 0.2)');
+      } else {
+        const reason = result.reason || (result.errors && result.errors[0]) || 'Verification failed';
+        setStatus('Error: ' + reason, 'rgba(255, 0, 0, 0.2)');
+      }
+    } catch (err) {
+      setStatus('Error: ' + err.message, 'rgba(255, 0, 0, 0.2)');
+    }
+  }
+
+  // Enter key to submit
+  promptInput.addEventListener('keypress', function (e) {
+    if (e.key === 'Enter' && !runButton.disabled) {
+      runGenerate();
+    }
+  });
+</script>
 </body>
 </html>
