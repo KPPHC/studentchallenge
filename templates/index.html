@@ -206,6 +206,39 @@
 
                     // Display QR codes if any were generated
                     if (data.qr_codes && data.qr_codes.length > 0) {
+                        // Add "Verify me" button that navigates to /recognize-qr-image
+                        let verifyBtn = document.getElementById('verifyButton');
+                        if (!verifyBtn) {
+                            verifyBtn = document.createElement('button');
+                            verifyBtn.id = 'verifyButton';
+                            verifyBtn.type = 'button';
+                            verifyBtn.textContent = 'Verify me';
+                            verifyBtn.style.marginTop = '0.5rem';
+                            verifyBtn.addEventListener('click', async () => {
+                                statusDiv.style.display = 'block';
+                                statusDiv.textContent = 'Verifying...';
+                                statusDiv.style.background = 'rgba(255, 255, 255, 0.1)';
+                                try {
+                                    const res = await fetch('/recognize-qr-image');
+                                    const result = await res.json();
+                                    if (res.ok && result.verified) {
+                                        statusDiv.textContent = 'Verified!';
+                                        statusDiv.style.background = 'rgba(0, 255, 0, 0.2)';
+                                    } else {
+                                        statusDiv.textContent = 'Error: ' + (result.error || 'Verification failed');
+                                        statusDiv.style.background = 'rgba(255, 0, 0, 0.2)';
+                                    }
+                                } catch (err) {
+                                    statusDiv.textContent = 'Error: ' + err.message;
+                                    statusDiv.style.background = 'rgba(255, 0, 0, 0.2)';
+                                }
+                            });
+                            // Place the button at the bottom of the QR container
+                            qrContainer.appendChild(verifyBtn);
+                        }
+                        // Ensure it is visible when QR codes are present
+                        verifyBtn.style.display = 'inline-block';
+                        
                         qrContainer.style.display = 'flex';
                         
                         data.qr_codes.forEach(filename => {

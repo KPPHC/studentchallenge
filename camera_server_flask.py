@@ -63,7 +63,6 @@ def run_claude_endpoint():
             if current_time - os.path.getmtime(file) < 5:
                 qr_files.append(file.name)
     
-    # Also needs to have the UUID
     response_data = {
         "output": result,
         "qr_codes": qr_files
@@ -72,6 +71,37 @@ def run_claude_endpoint():
     print(f"Response data: {response_data}")
     
     return jsonify(response_data)
+
+@app.route('/recognize-qr-image', methods=['GET'])
+def recognize_qr_image():
+    prompt = """Write a Python script that captures a 10 second video file from this devices webcamera (e.g., input.mp4), scans its frames, and detects the most probable QR code that appears in the video, and saves the QR code as a JSON file.
+The JSON output filepath is 'C:\Users\post97\OneDrive - Tartu Ülikool\PycharmProjects\studentchallenge\output.json'.
+
+Requirements: 
+1.	Output the result as a JSON file to standard output, like this qr_code <QR_CODE_CONTENT> 
+2.  Run the created Python script.
+3.  Python script saves output as JSON file.
+
+ultrathink"""
+
+    result = run_claude(prompt)
+
+    # Load expected UUID from file if it exists
+    expected_uuid = None
+    if os.path.exists("uuid.txt"):
+        with open("uuid.txt", "r") as f:
+            expected_uuid = f.read().strip()
+        print(f"UUID found: {expected_uuid}")
+
+    # Verify: result must contain a qr_code and it must match expected_uuid
+    verified = bool(result == expected_uuid)
+
+    response = {
+        "output": result,
+        "verified": verified,
+    }
+    
+    return jsonify(response)
 
 def run_claude(prompt: str, cwd: str = ".") -> str:
     """
