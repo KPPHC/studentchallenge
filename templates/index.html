@@ -218,6 +218,7 @@
     
     <script>
   // -------------------- Presets --------------------
+  // TODO: Change the prompts
   const PRESETS = {
     qr: {
       mode: 'qr',
@@ -234,6 +235,7 @@
   };
 
   let selectedMode = 'qr';
+  let currentSessionId = null;
 
   // -------------------- DOM refs --------------------
   const statusDiv = document.getElementById('status');
@@ -329,6 +331,7 @@
         body: prompt
       });
       const data = await response.json();
+      currentSessionId = data.session_id || null;
 
       if (!response.ok) {
         setStatus('Error: ' + (data.error || 'Unknown error'), 'rgba(255, 0, 0, 0.2)');
@@ -368,7 +371,15 @@
   async function runValidate(mode) {
     try {
       setStatus('Validating...', 'rgba(255, 255, 255, 0.1)');
-      const res = await fetch(`/validate?mode=${encodeURIComponent(mode)}`);
+      const payload = {
+        mode: mode,
+        sessiosn_id: currentSessionId || null
+      };
+      const res = await fetch('/validate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
       const result = await res.json();
       if (res.ok && result.verified) {
         setStatus('Verified!', 'rgba(0, 255, 0, 0.2)');
