@@ -33,14 +33,18 @@
         }
         
         #prompt {
-            padding: 10px;
+            padding: 14px;
             width: 100%;
-            max-width: 500px;
-            font-size: 14px;
-            border-radius: 4px;
+            max-width: 640px;
+            font-size: 16px;
+            line-height: 1.4;
+            border-radius: 6px;
             border: 1px solid #444;
             background: #222;
             color: #fff;
+            resize: vertical;
+            min-height: 80px;
+            white-space: pre-wrap;
         }
         
         button {
@@ -134,6 +138,59 @@
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
+        
+        /* Small phones */
+        @media (max-width: 480px) {
+            .container {
+                width: 95%;
+                gap: 0.75rem;
+            }
+            .controls {
+                gap: 0.75rem;
+            }
+            #prompt {
+                max-width: 100%;
+                font-size: 18px; /* larger, more readable */
+                padding: 16px;
+                min-height: 100px;
+            }
+            button {
+                width: 100%;
+                font-size: 18px;
+                padding: 14px 18px; /* touch friendly */
+            }
+            .presets .preset-btn {
+                flex: 1 1 45%;
+            }
+        }
+
+        /* Tablets / small laptops */
+        @media (min-width: 481px) and (max-width: 1024px) {
+            #prompt {
+                max-width: 720px;
+                font-size: 17px;
+                padding: 16px;
+                min-height: 120px;
+            }
+            button {
+                font-size: 17px;
+                padding: 12px 20px;
+            }
+        }
+
+        /* Desktops */
+        @media (min-width: 1025px) {
+            #prompt {
+                max-width: 720px;
+                font-size: 18px;
+                padding: 18px;
+                min-height: 140px;
+            }
+            button {
+                font-size: 17px;
+                padding: 12px 22px;
+            }
+        }
     </style>
 </head>
 <body>
@@ -146,7 +203,7 @@
               <button type="button" class="preset-btn" data-mode="gesture" data-id="gesture">Gesture detection</button>
               <button type="button" class="preset-btn" data-mode="object" data-id="object">Object detection</button>
             </div>
-            <input type="text" id="prompt" placeholder="Enter a prompt or choose a preset below...">
+            <textarea id="prompt" placeholder="Enter a prompt or choose a preset below..."></textarea>
             <button id="runButton" onclick="runGenerate()">Generate</button>
             <div class="spinner" id="spinner"></div>
         </div>
