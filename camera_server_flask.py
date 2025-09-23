@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import base64
 from flask import Flask, request, send_file, render_template, jsonify
@@ -258,27 +259,23 @@ def run_claude(prompt: str, cwd: str = ".", session_id=None) -> str:
     Returns:
         Claude's output as a string.
     """
+
+    exe = shutil.which("claude")
+    args = [exe, "--output-format", "json"]
+    if session_id:
+        args += ["-r", session_id]
+    args.append(prompt)
  
     try:
-        #r"C:\Users\post97\AppData\Roaming\npm\claude.cmd
-        if session_id:
-            result = subprocess.run(
-                ["claude", prompt, "-r", session_id, "--output-format", "json"],
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            return result.stdout
-        else:
-            result = subprocess.run(
-                ["claude", prompt, "--output-format", "json"],
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            return result.stdout
+        #r"C:\Users\post97\AppData\Roaming\npm\claude.cmd       
+        result = subprocess.run(
+            args,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return result.stdout
     except subprocess.CalledProcessError as e:
         return f"Error: {e.stderr}"
 
