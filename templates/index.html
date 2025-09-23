@@ -1,0 +1,262 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Video & QR Code</title>
+    <style>
+        body {
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            background: #000;
+            font-family: Arial, sans-serif;
+        }
+        
+        .container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 1rem;
+            width: 90%;
+            max-width: 800px;
+        }
+        
+        video {
+            max-width: 100%;
+            max-height: 60vh;
+            border-radius: 8px;
+        }
+        
+        .controls {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0.5rem;
+            width: 100%;
+        }
+        
+        #prompt {
+            padding: 10px;
+            width: 100%;
+            max-width: 500px;
+            font-size: 14px;
+            border-radius: 4px;
+            border: 1px solid #444;
+            background: #222;
+            color: #fff;
+        }
+        
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            transition: background 0.3s;
+        }
+        
+        button:hover {
+            background: #0056b3;
+        }
+        
+        button:disabled {
+            background: #444;
+            cursor: not-allowed;
+        }
+        
+        #status {
+            color: #fff;
+            margin-top: 0.5rem;
+            padding: 10px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 4px;
+            max-width: 100%;
+            word-wrap: break-word;
+            display: none;
+        }
+        
+        #qr-container {
+            margin-top: 1rem;
+            padding: 20px;
+            background: white;
+            border-radius: 8px;
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            gap: 1rem;
+        }
+        
+        #qr-container h3 {
+            margin: 0;
+            color: #333;
+        }
+        
+        .qr-image {
+            max-width: 300px;
+            max-height: 300px;
+            border: 2px solid #ddd;
+            padding: 10px;
+            background: white;
+            margin: 10px;
+        }
+        
+        .qr-images-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1rem;
+            justify-content: center;
+        }
+        
+        .download-link {
+            color: #007bff;
+            text-decoration: none;
+            padding: 5px 10px;
+            border: 1px solid #007bff;
+            border-radius: 4px;
+            transition: background 0.3s;
+        }
+        
+        .download-link:hover {
+            background: #007bff;
+            color: white;
+        }
+        
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #007bff;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            display: none;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <video src="/video" controls autoplay muted></video>
+        
+        <a href="/video" download style="color:#fff;">Download Video</a>
+        
+        <div class="controls">
+            <input type="text" id="prompt" placeholder="Enter prompt for Claude to generate QR code...">
+            <button id="runButton" onclick="runClaude()">Run Claude Code</button>
+            <div class="spinner" id="spinner"></div>
+        </div>
+        
+        <div id="status"></div>
+        
+        <div id="qr-container">
+            <h3>Generated QR Code(s)</h3>
+            <div id="qr-images" class="qr-images-grid"></div>
+        </div>
+    </div>
+    
+    <script>
+        async function runClaude() {
+            const prompt = document.getElementById('prompt').value;
+            const statusDiv = document.getElementById('status');
+            const qrContainer = document.getElementById('qr-container');
+            const qrImagesDiv = document.getElementById('qr-images');
+            const runButton = document.getElementById('runButton');
+            const spinner = document.getElementById('spinner');
+            
+            if (!prompt) {
+                statusDiv.style.display = 'block';
+                statusDiv.textContent = 'Please enter a prompt';
+                statusDiv.style.background = 'rgba(255, 0, 0, 0.2)';
+                return;
+            }
+            
+            // Reset UI
+            statusDiv.style.display = 'block';
+            statusDiv.textContent = 'Running Claude...';
+            statusDiv.style.background = 'rgba(255, 255, 255, 0.1)';
+            qrContainer.style.display = 'none';
+            qrImagesDiv.innerHTML = '';
+            runButton.disabled = true;
+            spinner.style.display = 'block';
+            
+            try {
+                const response = await fetch('/run-claude', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'text/plain; charset=utf-8'
+                    },
+                    body: prompt
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    statusDiv.textContent = 'Claude finished successfully!';
+                    statusDiv.style.background = 'rgba(0, 255, 0, 0.2)';
+                    
+                    console.log('Claude response data:', data);
+
+                    // Display QR codes if any were generated
+                    if (data.qr_codes && data.qr_codes.length > 0) {
+                        qrContainer.style.display = 'flex';
+                        
+                        data.qr_codes.forEach(filename => {
+                            // Create image element
+                            const img = document.createElement('img');
+                            img.src = `/qr-code/${filename}?t=${Date.now()}`; // Add timestamp to prevent caching
+                            img.className = 'qr-image';
+                            img.alt = 'QR Code';
+                            
+                            // Create container for image and download link
+                            const imgContainer = document.createElement('div');
+                            imgContainer.style.textAlign = 'center';
+                            
+                            // Create download link
+                            const downloadLink = document.createElement('a');
+                            downloadLink.href = `/qr-code/${filename}`;
+                            downloadLink.download = filename;
+                            downloadLink.className = 'download-link';
+                            downloadLink.textContent = `Download ${filename}`;
+                            
+                            imgContainer.appendChild(img);
+                            imgContainer.appendChild(document.createElement('br'));
+                            imgContainer.appendChild(downloadLink);
+                            
+                            qrImagesDiv.appendChild(imgContainer);
+                        });
+                    }
+                    
+                    // Show Claude's output if needed
+                    if (data.output) {
+                        console.log('Claude output:', data.output);
+                    }
+                } else {
+                    statusDiv.textContent = 'Error: ' + (data.error || 'Unknown error');
+                    statusDiv.style.background = 'rgba(255, 0, 0, 0.2)';
+                }
+            } catch(e) {
+                statusDiv.textContent = 'Error: ' + e.message;
+                statusDiv.style.background = 'rgba(255, 0, 0, 0.2)';
+            } finally {
+                runButton.disabled = false;
+                spinner.style.display = 'none';
+            }
+        }
+        
+        // Allow Enter key to submit
+        document.getElementById('prompt').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter' && !document.getElementById('runButton').disabled) {
+                runClaude();
+            }
+        });
+    </script>
+</body>
+</html>
