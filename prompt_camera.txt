@@ -1,0 +1,9 @@
+Write a Python script that captures a 10 second video file from this devices webcamera (e.g., input.mp4), scans its frames, and detects the most probable QR code that appears in the video, and saves the QR code as a JSON file.
+The JSON output filepath is 'C:\Users\post97\OneDrive - Tartu Ülikool\PycharmProjects\studentchallenge\output.json'.
+
+Requirements: 
+1.	Output the result as a JSON file to standard output, like this qr_code <QR_CODE_CONTENT> 
+2.  Run the created Python script.
+3.  Python script saves output as JSON file.
+
+ultrathink

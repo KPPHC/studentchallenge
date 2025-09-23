@@ -1,0 +1,11 @@
+Write a Python script that loads a video file (e.g., input.mp4), scans its frames, and detects the most probable QR code that appears in the video, and saves the QR code as a JSON file.
+The input filepath is 'C:\Users\post97\OneDrive - Tartu Ülikool\PycharmProjects\studentchallenge\output.mp4'.
+The output filepath is 'C:\Users\post97\OneDrive - Tartu Ülikool\PycharmProjects\studentchallenge\output.json'.
+
+Requirements: 
+1.	The choice of libraries is flexible. 
+2.	Output the result as a JSON file to standard output, like this qr_code <QR_CODE_CONTENT> 
+3.  Run the created Python script.
+4.  Python script saves output as JSON file.
+
+ultrathink

@@ -1,0 +1,3 @@
+Write a Python script that creates a QR code image with a UUID. Save it as an image file 'qr_code.jpg'. Save also the UUID in txt-file.
+
+ultrathink
