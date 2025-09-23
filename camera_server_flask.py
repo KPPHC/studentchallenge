@@ -8,22 +8,12 @@ app = Flask(__name__)
 
 HOST = "0.0.0.0"
 PORT = 8080
-VIDEO_PATH = "output.mp4"  # Change this to your video filename
 
-# Video should be removed later on
+
 @app.route('/')
 def index():
-    """Serve the main page with video player."""
-    if not os.path.exists(VIDEO_PATH):
-        return "<h1>Video not found</h1>", 404
-    
-    return render_template('index.html', video_filename=os.path.basename(VIDEO_PATH))
+    return render_template('index.html')
 
-@app.route('/video')
-def video():
-    if not os.path.exists(VIDEO_PATH):
-        return "Video not found", 404
-    return send_file(VIDEO_PATH, mimetype='video/mp4')
 
 @app.route('/qr-code/<filename>')
 def serve_qr_code(filename):
@@ -100,7 +90,7 @@ ultrathink"""
         "output": result,
         "verified": verified,
     }
-    
+
     return jsonify(response)
 
 def run_claude(prompt: str, cwd: str = ".") -> str:
@@ -127,6 +117,4 @@ def run_claude(prompt: str, cwd: str = ".") -> str:
         return f"Error: {e.stderr}"
 
 if __name__ == "__main__":
-    print(f"Open http://{HOST}:{PORT}/ to view the video (use your LAN IP on other devices).")
-    print(f"Make sure '{VIDEO_PATH}' exists in this directory.")
     app.run(host=HOST, port=PORT, debug=False)
