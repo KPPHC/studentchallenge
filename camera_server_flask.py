@@ -6,11 +6,19 @@ from flask import Flask, request, send_file, render_template, jsonify
 from pathlib import Path
 import re
 from typing import Dict, Any, List, Optional
+from werkzeug.utils import secure_filename
+from camera import register_camera_routes
 
 app = Flask(__name__)
+register_camera_routes(app)
 
 HOST = "0.0.0.0"
 PORT = 8080
+
+
+SESSIONS = {}  # {session_id: {"mode": "gesture"|"object", "video_path": str|None}}
+UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ---- Helpers ---------------------------------------------------------------
 def _list_recent_qr_images() -> List[str]:
@@ -99,6 +107,7 @@ def serve_qr_code(filename):
 @app.route('/generate', methods=['POST'])
 def generate():
     prompt = request.get_data(as_text=True)
+    mode = request.args.get('mode', 'qr')  # read mode
     ## TODO: We can add system prompt.
 
     print(f"\n{'='*50}")
@@ -108,6 +117,18 @@ def generate():
 
     if not prompt:
         return jsonify({"error": "No prompt provided"}), 400
+
+    #TODO: Make sure the video feed timing makes sense.
+    #Currently, when user presses 'Generate', the video feed starts.
+    if mode in ('gesture', 'object'):
+        return jsonify({
+            "session_id": None,
+            "kind": "live",
+            "output_text": "",
+            "data": {},
+            "errors": [],
+            "stream_url": "/video_feed"
+        }), 200
 
     result = run_claude(prompt)
 
@@ -158,24 +179,36 @@ Requirements:
 3. Python script saves output as JSON file.
 
 ultrathink"""
+    
     elif mode == 'gesture':
-        prompt = """Write a Python script that captures a short video from the device's webcam, analyzes frames to detect a gesture, and outputs a line like 'gesture <NAME>' to stdout and saves the result to a JSON file.
+        prompt = """Run the thumbs_up_detector.py script to detect thumbs-up gestures from the webcam. The script will capture video, detect the gesture, print 'gesture thumbs_up' when detected, and save results to output.json.
 
 Requirements:
-1. Output the gesture detection result as a JSON file to standard output.
-2. Run the created Python script.
+1. Execute the existing thumbs_up_detector.py script
+2. The script outputs 'gesture thumbs_up' to stdout when detected
+3. Results are saved to output.json with verification status
 
 ultrathink"""
+
     elif mode == 'object':
-        prompt = """Write a Python script that captures a short video or frame from the device's webcam, detects the most probable object, and outputs a line like 'object <NAME>' to stdout and saves the result to a JSON file.
+        session_id = provided_session_id
+        SESSIONS.setdefault(session_id, {"mode": mode, "video_path": None})
+        return jsonify({
+            "status": "ready",
+            "message": f"{mode.capitalize()} mode ready. Live camera stream available.",
+            "session_id": session_id,
+            "stream_url": "/video_feed"
+        }), 200
+#     elif mode == 'object':
+#         prompt = """Write a Python script that captures a short video or frame from the device's webcam, detects the most probable object, and outputs a line like 'object <NAME>' to stdout and saves the result to a JSON file.
 
-Requirements:
-1. Output the object detection result as a JSON file to standard output.
-2. Run the created Python script.
+# Requirements:
+# 1. Output the object detection result as a JSON file to standard output.
+# 2. Run the created Python script.
 
-ultrathink"""
-    else:
-        return jsonify({"error": f"Unsupported mode: {mode}"}), 400
+# ultrathink"""
+#     else:
+#         return jsonify({"error": f"Unsupported mode: {mode}"}), 400
 
 ## TODO: When it's object detection, gesture detection, validation step skipped. Check it. 
 ## maybe in the generate step, claude is now running the code and return the result. 

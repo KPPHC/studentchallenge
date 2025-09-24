@@ -210,6 +210,12 @@
         
         <div id="status"></div>
         
+        <div id="live-container" style="display:none; margin-top:1rem; width:100%; text-align:center;">
+          <img id="live-video" src="" alt="Live stream"
+              style="max-width:100%; height:auto; border-radius:12px;"/>
+          <div style="color:#ccc; margin-top:0.5rem;">Live camera from server</div>
+        </div>
+
         <div id="qr-container">
             <h3>Generated Result</h3>
             <div id="qr-images" class="qr-images-grid"></div>
@@ -233,6 +239,9 @@
       prompt: "I will present an apple to the camera. Build a system that captures from the webcam, detects the apple, and verifies me when it is recognized. The script should print a line like: object apple and also save a JSON result."
     }
   };
+
+  const liveContainer = document.getElementById('live-container');
+  const liveImg = document.getElementById('live-video');
 
   let selectedMode = 'qr';
   let currentSessionId = null;
@@ -307,6 +316,10 @@
       selectedMode = preset.mode;
       promptInput.value = preset.prompt;
       setStatus(`Preset selected: ${id}`, 'rgba(255, 255, 255, 0.1)');
+
+      liveContainer.style.display = 'none';
+      liveImg.src = '';
+      clearResults();
     });
   });
 
@@ -325,13 +338,24 @@
     spinner.style.display = 'block';
 
     try {
-      const response = await fetch('/generate', {
+      const response = await fetch(`/generate?mode=${encodeURIComponent(selectedMode)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain; charset=utf-8' },
         body: prompt
       });
       const data = await response.json();
       currentSessionId = data.session_id || null;
+
+      if ((selectedMode === 'gesture' || selectedMode === 'object') && data.stream_url) {
+        qrContainer.style.display = 'none';
+        // cache-bust to keep it fresh; also pass session_id if you like
+        const url = `${data.stream_url}?sid=${encodeURIComponent(data.session_id || '')}&t=${Date.now()}`;
+        liveImg.src = url;
+        liveContainer.style.display = 'block';
+      } else {
+        liveContainer.style.display = 'none';
+        liveImg.src = '';
+      }
 
       if (!response.ok) {
         setStatus('Error: ' + (data.error || 'Unknown error'), 'rgba(255, 0, 0, 0.2)');
@@ -373,7 +397,7 @@
       setStatus('Validating...', 'rgba(255, 255, 255, 0.1)');
       const payload = {
         mode: mode,
-        sessiosn_id: currentSessionId || null
+        session_id: currentSessionId || null
       };
       const res = await fetch('/validate', {
         method: 'POST',
