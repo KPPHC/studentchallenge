@@ -15,6 +15,58 @@ import threading
 import time
 from datetime import datetime
 
+REGISTRY_PATH = os.path.join(os.getcwd(), "runners_registry.json")
+
+# Registry helpers
+def _load_registry() -> Dict[str, Dict[str, str]]:
+    if os.path.exists(REGISTRY_PATH):
+        try:
+            with open(REGISTRY_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+                if isinstance(data, dict):
+                    data.setdefault('gesture', {})
+                    data.setdefault('object', {})
+                    return data
+        except Exception:
+            pass
+    return {'gesture': {}, 'object': {}}
+
+def _save_registry(reg: Dict[str, Dict[str, str]]):
+    try:
+        with open(REGISTRY_PATH, "w", encoding="utf-8") as f:
+            json.dump(reg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def _slugify(name: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9]+", "_", name.strip().lower()).strip("_")
+    s = re.sub(r"_+", "_", s)
+    return s or "item"
+
+def _register_runner(mode: str, display_name: str, source_script: Optional[str]) -> Optional[str]:
+    """Copy the current runner to a named file and register it. Returns target script path if success."""
+    if mode not in ("gesture", "object"):
+        return None
+    if not display_name:
+        return None
+    reg = _load_registry()
+    slug = _slugify(display_name)
+    suffix = "_gesture.py" if mode == "gesture" else "_object.py"
+    target = os.path.join(os.getcwd(), f"{slug}{suffix}")
+    # Copy source if available and different
+    try:
+        if source_script and os.path.exists(source_script) and os.path.abspath(source_script) != os.path.abspath(target):
+            shutil.copyfile(source_script, target)
+    except Exception:
+        # best-effort; if copy fails, still register path
+        pass
+    # Register
+    reg.setdefault(mode, {})
+    reg[mode][display_name] = os.path.basename(target)
+    _save_registry(reg)
+    return target
+
+
 app = Flask(__name__)
 register_camera_routes(app)
 
@@ -111,6 +163,25 @@ def _read_job_status(job_id: str) -> Dict[str, Any]:
                                 status['data'][k] = v
         except Exception:
             pass
+    # Auto-register newly verified gesture/object into registry (idempotent)
+    try:
+        data = status.get('data') or {}
+        verified = bool(data.get('verified')) or (status.get('phase') == 'done' and data)
+        mode = status.get('mode') or ''
+        source_script = (status.get('script') or '').strip() or None
+        if verified and mode in ('gesture', 'object'):
+            name_key = 'gesture' if mode == 'gesture' else 'object'
+            display_name = data.get(name_key)
+            if display_name:
+                reg = _load_registry()
+                already = reg.get(mode, {}).get(display_name)
+                if not already:
+                    target = _register_runner(mode, display_name, source_script)
+                    if target:
+                        status.setdefault('registry', {})
+                        status['registry'][name_key] = os.path.basename(target)
+    except Exception:
+        pass
     return status
 
 def _run_claude_background(prompt: str, job_id: str, session_id: Optional[str], mode: str, script_path: str):
@@ -130,7 +201,11 @@ def _run_claude_background(prompt: str, job_id: str, session_id: Optional[str], 
     try:
         proc_log_path = os.path.join(d, "script.log")
         proc_out = open(proc_log_path, "w", encoding="utf-8")
-        proc = subprocess.Popen([sys.executable, "-u", script_path], stdout=proc_out, stderr=subprocess.STDOUT)
+        env = os.environ.copy()
+        env['JOB_ID'] = job_id
+        env['JOB_DIR'] = d
+        proc = subprocess.Popen([sys.executable, "-u", script_path],
+                                 stdout=proc_out, stderr=subprocess.STDOUT, env=env)
         _write_json(status_path, {"phase": "running", "session_id": sid or session_id, "pid": proc.pid, "script": script_path, "mode": mode})
     except Exception as e:
         _write_json(status_path, {"phase": "error", "message": f"Failed to start script: {e}"})
@@ -203,6 +278,66 @@ ultrathink"""
             "stream_url": "/video_feed"
         }), 200
 
+
+# --- Fast path: /reuse (no Claude, just reuse existing runner scripts) ---
+@app.route('/instant-run', methods=['POST'])
+def instant_run():
+    """Fast path that reuses existing code without Claude.
+    Expects JSON: {
+      mode: 'qr'|'gesture'|'object',
+      action: 'generate'|'validate',
+      displayName?: str,   # human-friendly name of preset, e.g., 'thumb up'
+      scriptName?: str,    # exact python filename, e.g., 'thumb_up_gesture.py'
+      prompt?: str
+    }
+    """
+    body = request.get_json(silent=True) or {}
+    mode = body.get('mode', 'qr')
+    action = body.get('action', 'generate')  # 'generate' or 'validate'
+
+    if action == 'generate':
+        display_name = (body.get('displayName') or '').strip() or None
+        script_name = (body.get('scriptName') or '').strip() or None
+        script_path = os.path.join(os.getcwd(), script_name)
+        return jsonify({
+            'status': 'ok',
+            'kind': 'live',
+            'data': {'script_name': script_name},
+            'stream_url': '/video_feed'
+        }), 200
+    else:
+        display_name = (body.get('displayName') or '').strip() or None
+        script_name = (body.get('scriptName') or '').strip() or None
+        script_path = os.path.join(os.getcwd(), script_name)
+        job_id = str(uuid.uuid4())
+        print(job_id)
+        d = _job_dir(job_id)
+        _write_json(os.path.join(d, 'status.json'), {
+            'phase': 'running',
+            'script': script_path,
+            'mode': mode,
+            'displayName': display_name,
+            'scriptName': os.path.basename(script_path)
+        })
+        # Touch READY immediately so UI can switch; the runner should later write detected/done
+        _write_json(os.path.join(d, 'script_status.json'), {'phase': 'ready'})
+
+        try:
+            if not os.path.exists(script_path):
+                raise FileNotFoundError(f"Runner not found: {os.path.basename(script_path)}")
+            proc_log_path = os.path.join(d, 'script.log')
+            proc_out = open(proc_log_path, 'w', encoding='utf-8')
+            env = os.environ.copy()
+            env['JOB_ID'] = job_id
+            env['JOB_DIR'] = d
+            proc = subprocess.Popen([sys.executable, "-u", script_path],
+                                    stdout=proc_out, stderr=subprocess.STDOUT, env=env)
+            return jsonify({ 'status': 'accepted', 'job_id': job_id, 'poll_url': f'/job-status?job_id={job_id}' }), 202
+        except Exception as e:
+            _write_json(os.path.join(d, 'status.json'), {'phase': 'error', 'message': f'Failed to start runner: {e}'})
+            return jsonify({'status': 'error', 'message': str(e)}), 500
+
+    
 @app.route('/validate', methods=['POST'])
 def validate():
     mode = request.args.get('mode', 'qr')
@@ -302,13 +437,31 @@ ultrathink"""
     hook_instructions = f"""
 \nHook requirements (DO NOT SKIP):
 - The server will execute the script at: {script_path}. Do NOT execute it yourself.
-- Ensure the script writes the following signals to "{job_dir_abs}/script_status.json":
-  * As soon as the webcam is opened and the main processing loop is about to start, do both:
-    1) print("PHASE READY", flush=True)
-    2) write JSON {{"phase":"ready"}}
-  * On successful detection, write JSON with details, e.g. for gesture: {{"phase":"detected","gesture":"thumbs_up","confidence": <0..1>}}
-    and also print the one-line stdout key (e.g., "gesture thumbs_up", "object <CLASS>", "qr_code <VALUE>") with flush=True.
-  * On normal finish, write {{"phase":"done","verified": <true|false>}}; on fatal error, write {{"phase":"error","message":"..."}} and exit non-zero.
+- Environment variables provided by the server:
+  * JOB_ID  → current job id (string)
+  * JOB_DIR → absolute path to jobs/<job_id>
+  * TARGET_NAME → optional target to detect (e.g., 'thumb up', 'STOP', 'apple'). Prefer this over parsing prompt.
+- The script MUST write phase updates to os.path.join(os.environ.get('JOB_DIR', '.'), 'script_status.json') as UTF-8 JSON:
+  * READY  → as soon as webcam opens and the main loop is about to start:
+      - print("PHASE READY", flush=True)
+      - write {{"phase":"ready"}}
+  * DETECTED → on successful detection, write one of:
+      - gesture: {{"phase":"detected","gesture":"<NAME>","confidence": <0..1>}}
+      - object : {{"phase":"detected","object":"<CLASS>","confidence": <0..1>}}
+      - qr     : {{"phase":"detected","uuid":"<VALUE>"}}
+    And also print exactly one line to stdout (e.g., "gesture <NAME>", "object <CLASS>", "qr_code <VALUE>") with flush=True.
+  * DONE / ERROR → on normal finish write {{"phase":"done","verified": <true|false>}}; on fatal error write {{"phase":"error","message":"..."}} and exit non-zero.
+- Canonical outputs (write to current working directory so the server can always pick them up):
+  - gesture → gesture_output.json   e.g., {{"gesture":"<NAME>","verified":true,"confidence":0.xx}}
+  - object  → object_output.json    e.g., {{"object":"<CLASS>","verified":true,"confidence":0.xx}}
+  - qr      → uuid.json             e.g., {{"uuid":"<VALUE>"}}
+- Parameterization for reuse:
+  - Determine the target to detect in this order:
+      1) os.environ.get("TARGET_NAME")      # highest priority
+      2) A JSON file at os.path.join(os.environ.get("JOB_DIR","."), "target.json")
+         with {{"gesture":"..."}} or {{"object":"..."}}
+      3) Fallback to parsing from the prompt text
+  - Do NOT hardcode paths or the target; make the detection logic reusable.
 - All prints must use flush=True to avoid buffering.
 """
     prompt_with_hooks = prompt + hook_instructions
@@ -336,6 +489,12 @@ def job_status():
         return jsonify({"error": "job_id is required"}), 400
     s = _read_job_status(job_id)
     return jsonify(s)
+
+@app.route('/presets', methods=['GET'])
+def presets():
+    reg = _load_registry()
+    return jsonify(reg)
+
 
 def run_claude(prompt: str, cwd: str = ".", session_id=None):
     """
@@ -374,6 +533,7 @@ def run_claude(prompt: str, cwd: str = ".", session_id=None):
         return stdout, sid
     except subprocess.CalledProcessError as e:
         return f"Error: {e.stderr}", None
+
 
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, debug=False)

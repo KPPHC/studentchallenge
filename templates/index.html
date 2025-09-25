@@ -205,10 +205,14 @@
             </div>
             <textarea id="prompt" placeholder="Enter a prompt or choose a preset below..."></textarea>
             <button id="runButton" onclick="runGenerate()">Generate</button>
+            <!-- <button id="reuseButton" title="Run with existing code (no generation)">Instant Run</button> -->
             <div class="spinner" id="spinner"></div>
         </div>
         
         <div id="status"></div>
+        <div id="gesture-presets" class="preset-group" style="display:none;width:100%;max-width:800px;margin-top:6px;"></div>
+        <div id="object-presets" class="preset-group" style="display:none;width:100%;max-width:800px;margin-top:6px;"></div>
+        <div id="presetList" style="display:none;width:100%;max-width:800px;margin-top:8px;"></div>
         
         <div id="live-container" style="display:none; margin-top:1rem; width:100%; text-align:center;">
           <img id="live-video" src="" alt="Live stream"
@@ -245,6 +249,8 @@
 
   let selectedMode = 'qr';
   let currentSessionId = null;
+  let lastUserPrompt = '';
+  const reuseButton = document.getElementById('reuseButton');
 
   // -------------------- DOM refs --------------------
   const statusDiv = document.getElementById('status');
@@ -307,9 +313,294 @@
     verifyBtn.style.display = 'inline-block';
   }
 
+  // -------------------- Mode-specific Presets Group --------------------
+  async function loadPresetsGroup(mode) {
+  try {
+    const res = await fetch('/presets', { cache: 'no-store' });
+    const data = await res.json();
+    renderPresetGroup(mode, data);
+  } catch (e) {
+    console.warn('failed to load presets group', mode, e);
+  }
+}
+
+// Helper for Verify button in reuse path
+function addVerifyButtonInstant(mode) {
+    let verifyBtn = document.getElementById('verifyButtonReuse');
+    if (!verifyBtn) {
+      verifyBtn = document.createElement('button');
+      verifyBtn.id = 'verifyButtonReuse';
+      verifyBtn.type = 'button';
+      verifyBtn.textContent = 'Verify (Instant)';
+      verifyBtn.style.marginTop = '0.5rem';
+      verifyBtn.addEventListener('click', () => runInstantValidate(mode));
+      qrContainer.appendChild(verifyBtn);
+    }
+    verifyBtn.style.display = 'inline-block';
+  }
+
+  function renderPresetGroup(mode, data) {
+  const containerId = mode === 'gesture' ? 'gesture-presets' : (mode === 'object' ? 'object-presets' : null);
+  if (!containerId) return;
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  container.style.display = 'block';
+  container.innerHTML = '';
+
+  const title = document.createElement('h4');
+  title.textContent = mode === 'gesture' ? 'Saved gesture presets' : 'Saved object presets';
+  title.style.color = '#fff';
+  title.style.margin = '6px 0 8px';
+  container.appendChild(title);
+
+  const entries = (data && data[mode]) ? Object.entries(data[mode]) : [];
+  if (!entries.length) {
+    const p = document.createElement('p');
+    p.textContent = 'No presets yet';
+    p.style.color = '#aaa';
+    container.appendChild(p);
+    return;
+  }
+
+  const list = document.createElement('div');
+  list.style.display = 'flex';
+  list.style.flexWrap = 'wrap';
+  list.style.gap = '8px';
+
+  entries.forEach(([displayName, scriptName]) => {
+    const card = document.createElement('div');
+    card.style.display = 'flex';
+    card.style.alignItems = 'center';
+    card.style.gap = '8px';
+    card.style.background = 'rgba(255,255,255,0.06)';
+    card.style.borderRadius = '8px';
+    card.style.padding = '8px 10px';
+
+    const label = document.createElement('span');
+    label.textContent = `${displayName}`;
+    label.style.color = '#ddd';
+
+    const btn = document.createElement('button');
+    btn.textContent = 'Instant Run';
+    btn.className = 'btn-secondary';
+    btn.onclick = async () => {
+      selectedMode = mode;
+      clearResults();
+      setStatus('Using preset...', 'rgba(255,255,255,0.1)');
+      // Initialize via /reuse generate (instant path)
+      const genRes = await fetch('/instant-run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          mode: selectedMode,
+          action: 'generate',
+          displayName: displayName,
+          scriptName: scriptName,
+      })
+      });
+      const genData = await genRes.json();
+      if (!genRes.ok) {
+        setStatus('Error: ' + (genData.error || 'Failed to initialize'), 'rgba(255,0,0,0.2)');
+        return;
+      }
+      const streamUrl = (genData.stream_url || '/video_feed') + `?t=${Date.now()}`;
+      liveImg.src = streamUrl;
+      liveContainer.style.display = 'block';
+      await runInstantValidate(selectedMode, genData.data.script_name);
+    };
+
+    card.appendChild(label);
+    card.appendChild(btn);
+    list.appendChild(card);
+  });
+
+  container.appendChild(list);
+}
+
+  // Instant run/validate path
+  async function runInstantValidate(mode, scriptName = null) {
+    try {
+      console.log('Instant validate', mode);
+      setStatus('Validating (instant)...', 'rgba(255,255,255,0.1)');
+      const res = await fetch('/instant-run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode, action: 'validate', scriptName: scriptName, prompt: lastUserPrompt || promptInput.value.trim() || '' })
+      });
+      if (res.status === 202) {
+        const { job_id, poll_url } = await res.json();
+        if (window.__jobPoll) clearInterval(window.__jobPoll);
+        window.__jobPoll = setInterval(async () => {
+          try {
+            const r = await fetch(poll_url, { cache: 'no-store' });
+            const s = await r.json();
+            setStatus(`Phase: ${s.phase || 'unknown'}`, 'rgba(255,255,255,0.08)');
+            if (s.phase === 'ready') {
+              const existingInstruction = document.getElementById('live-instruction');
+              if (existingInstruction) existingInstruction.remove();
+              const instruction = document.createElement('p');
+              instruction.id = 'live-instruction';
+              instruction.style.color = '#fff';
+              instruction.style.marginTop = '0.5rem';
+              instruction.textContent = mode === 'gesture' ? 'Start your gesture in front of the camera...' : (mode === 'object' ? 'Show the object to the camera...' : 'Scanning...');
+              statusDiv.insertAdjacentElement('afterend', instruction);
+            }
+            if (s.phase === 'detected' || s.phase === 'done' || s.phase === 'error') {
+              clearInterval(window.__jobPoll);
+              if (s.data) {
+                const pre = document.createElement('pre');
+                pre.style.color = '#ddd';
+                pre.style.background = 'rgba(255,255,255,0.06)';
+                pre.style.padding = '8px';
+                pre.style.borderRadius = '6px';
+                pre.textContent = JSON.stringify(s.data, null, 2);
+                statusDiv.insertAdjacentElement('afterend', pre);
+              }
+              // Refresh presets when job is done (new verified may be registered)
+              loadPresets();
+              if (selectedMode === 'gesture') { loadPresetsGroup('gesture'); }
+              if (selectedMode === 'object') { loadPresetsGroup('object'); }
+              if (s.phase === 'error') setStatus('Error: detection failed.', 'rgba(255,0,0,0.2)');
+              else if (s.phase === 'done') setStatus('Completed.', 'rgba(0,255,0,0.2)');
+              else setStatus('Detected!', 'rgba(0,255,0,0.2)');
+            }
+          } catch (err) { console.error('reuse poll error', err); }
+        }, 1000);
+      } else {
+        const data = await res.json();
+        setStatus('Error: ' + (data.error || 'Unexpected response'), 'rgba(255,0,0,0.2)');
+      }
+    } catch (e) {
+      setStatus('Error: ' + e.message, 'rgba(255,0,0,0.2)');
+    }
+  }
+
+  if (reuseButton) {
+    reuseButton.addEventListener('click', async () => {
+      const prompt = promptInput.value.trim();
+      lastUserPrompt = prompt;
+      if (!prompt) {
+        setStatus('Please enter a prompt or choose a preset', 'rgba(255,0,0,0.2)');
+        return;
+      }
+      clearResults();
+      setStatus('Using existing code...', 'rgba(255,255,255,0.1)');
+      // Initialize via /reuse generate
+      const genRes = await fetch('/instant-run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: selectedMode, action: 'generate', prompt })
+      });
+      const genData = await genRes.json();
+      if (!genRes.ok) {
+        setStatus('Error: ' + (genData.error || 'Failed to initialize'), 'rgba(255,0,0,0.2)');
+        return;
+      }
+      // Show live feed always
+      const streamUrl = (genData.stream_url || '/video_feed') + `?t=${Date.now()}`;
+      liveImg.src = streamUrl;
+      liveContainer.style.display = 'block';
+      if (selectedMode === 'qr') {
+        const files = (genData.data && genData.data.qr_codes) ? genData.data.qr_codes : [];
+        if (files.length) { showQrImages(files); addVerifyButtonInstant(selectedMode); }
+        if (genData.data && genData.data.text) {
+          const p = document.createElement('p');
+          p.style.color = '#fff';
+          p.textContent = genData.data.text;
+          statusDiv.insertAdjacentElement('afterend', p);
+        }
+        setStatus('QR ready. Click Verify (Instant).', 'rgba(0,255,0,0.2)');
+        return;
+      }
+      await runInstantValidate(selectedMode);
+    });
+  }
+
+  // Preset registry UI
+  async function loadPresets() {
+    try {
+      const res = await fetch('/presets', { cache: 'no-store' });
+      const data = await res.json();
+      renderPresetList(data);
+    } catch (e) {
+      console.warn('failed to load presets', e);
+    }
+  }
+
+  function renderPresetList(data) {
+    const container = document.getElementById('presetList');
+    if (!container) return;
+    container.innerHTML = '';
+    const groups = [
+      { key: 'gesture', title: 'Available Gestures' },
+      { key: 'object', title: 'Available Objects' }
+    ];
+    groups.forEach(g => {
+      const entries = (data && data[g.key]) ? Object.entries(data[g.key]) : [];
+      const section = document.createElement('div');
+      const h = document.createElement('h4');
+      h.textContent = g.title;
+      h.style.color = '#fff';
+      h.style.margin = '8px 0 4px';
+      section.appendChild(h);
+      if (!entries.length) {
+        const p = document.createElement('p');
+        p.textContent = 'No presets yet';
+        p.style.color = '#aaa';
+        section.appendChild(p);
+      } else {
+        entries.forEach(([displayName, scriptName]) => {
+          const row = document.createElement('div');
+          row.style.display = 'flex';
+          row.style.alignItems = 'center';
+          row.style.gap = '8px';
+          row.style.marginBottom = '6px';
+          const label = document.createElement('span');
+          label.textContent = `${displayName} (${scriptName})`;
+          label.style.color = '#ddd';
+          const btn = document.createElement('button');
+          btn.textContent = 'Instant Run';
+          btn.className = 'btn-secondary';
+          btn.onclick = async () => {
+            selectedMode = g.key;
+            const phrase = g.key === 'gesture'
+              ? `I want to verify myself with a specific gesture. The gesture is '${displayName}'.`
+              : `I want to verify myself with a specific object. The object is '${displayName}'.`;
+            promptInput.value = phrase;
+            lastUserPrompt = phrase;
+            clearResults();
+            setStatus('Using preset...', 'rgba(255,255,255,0.1)');
+            const genRes = await fetch('/instant-run', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ mode: selectedMode, action: 'generate', prompt: phrase })
+            });
+            const genData = await genRes.json();
+            if (!genRes.ok) {
+              setStatus('Error: ' + (genData.error || 'Failed to initialize'), 'rgba(255,0,0,0.2)');
+              return;
+            }
+            const streamUrl = (genData.stream_url || '/video_feed') + `?t=${Date.now()}`;
+            liveImg.src = streamUrl;
+            liveContainer.style.display = 'block';
+            if (selectedMode === 'qr') {
+              const files = (genData.data && genData.data.qr_codes) ? genData.data.qr_codes : [];
+              if (files.length) { showQrImages(files); addVerifyButtonInstant(selectedMode); }
+            }
+            await runInstantValidate(selectedMode);
+          };
+          row.appendChild(label);
+          row.appendChild(btn);
+          section.appendChild(row);
+        });
+      }
+      container.appendChild(section);
+    });
+  }
+
   // -------------------- Preset wiring --------------------
   document.querySelectorAll('.preset-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       const id = btn.getAttribute('data-id');
       const preset = PRESETS[id];
       if (!preset) return;
@@ -317,9 +608,24 @@
       promptInput.value = preset.prompt;
       setStatus(`Preset selected: ${id}`, 'rgba(255, 255, 255, 0.1)');
 
+      // Reset display
       liveContainer.style.display = 'none';
       liveImg.src = '';
       clearResults();
+
+      // Toggle preset groups beneath buttons
+      const gDiv = document.getElementById('gesture-presets');
+      const oDiv = document.getElementById('object-presets');
+      if (selectedMode === 'gesture') {
+        if (oDiv) oDiv.style.display = 'none';
+        if (gDiv) { gDiv.style.display = 'block'; await loadPresetsGroup('gesture'); }
+      } else if (selectedMode === 'object') {
+        if (gDiv) gDiv.style.display = 'none';
+        if (oDiv) { oDiv.style.display = 'block'; await loadPresetsGroup('object'); }
+      } else {
+        if (gDiv) gDiv.style.display = 'none';
+        if (oDiv) oDiv.style.display = 'none';
+      }
     });
   });
 
@@ -327,83 +633,62 @@
   async function runGenerate() {
     const prompt = promptInput.value.trim();
     if (!prompt) {
-      setStatus('Please enter a prompt or choose a preset', 'rgba(255, 0, 0, 0.2)');
+      setStatus('Please enter a prompt or choose a preset', 'rgba(255,0,0,0.2)');
       return;
     }
+    lastUserPrompt = prompt;
 
-    // Reset UI
-    setStatus('Generating with Claude...', 'rgba(255, 255, 255, 0.1)');
+    setStatus('Generating with Claude...', 'rgba(255,255,255,0.1)');
     clearResults();
     runButton.disabled = true;
+    if (reuseButton) reuseButton.disabled = true;
     spinner.style.display = 'block';
 
     try {
-      if (selectedMode === 'gesture' || selectedMode === 'object') {
-        // Gesture/Object: hit /generate FIRST to initialize live feed on server, then /validate
-        setStatus('Preparing detector...', 'rgba(255, 255, 255, 0.1)');
-        const genRes = await fetch(`/generate?mode=${encodeURIComponent(selectedMode)}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-          body: prompt
-        });
-        const genData = await genRes.json();
-        currentSessionId = genData.session_id || null;
+      // Always hit /generate first for all modes
+      const response = await fetch(`/generate?mode=${encodeURIComponent(selectedMode)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+        body: prompt
+      });
+      const data = await response.json();
+      currentSessionId = data.session_id || null;
 
-        // Show live feed (prefer returned stream_url, fallback to /video_feed)
-        const streamUrl = (genData.stream_url || '/video_feed') + `?t=${Date.now()}`;
-        qrContainer.style.display = 'none';
-        liveImg.src = streamUrl;
-        liveContainer.style.display = 'block';
+      // Show live feed for every mode
+      const streamUrl = (data.stream_url || '/video_feed') + `?t=${Date.now()}`;
+      liveImg.src = streamUrl;
+      liveContainer.style.display = 'block';
 
-        if (!genRes.ok) {
-          setStatus('Error during generate: ' + (genData.error || 'Unknown error'), 'rgba(255, 0, 0, 0.2)');
-          return;
-        }
+      if (!response.ok) {
+        setStatus('Error: ' + (data.error || 'Unknown error'), 'rgba(255,0,0,0.2)');
+        return;
+      }
 
-        // Immediately kick off validation; READY/DETECTED/ERROR will be handled via polling in runValidate
-        await runValidate(selectedMode, prompt);
-      } else {
-        // Non-live modes (e.g., QR)
-        const response = await fetch(`/generate?mode=${encodeURIComponent(selectedMode)}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-          body: prompt
-        });
-        const data = await response.json();
-        currentSessionId = data.session_id || null;
-        liveContainer.style.display = 'none';
-        liveImg.src = '';
-
-        if (!response.ok) {
-          setStatus('Error: ' + (data.error || 'Unknown error'), 'rgba(255, 0, 0, 0.2)');
-          return;
-        }
-
-        if (data.errors && data.errors.length) {
-          setStatus('Completed with warnings: ' + data.errors.join('; '));
-        } else {
-          setStatus('Generation finished successfully!', 'rgba(0, 255, 0, 0.2)');
-        }
-
-        // Render results
+      if (selectedMode === 'qr') {
+        // Render QR results
         const files = (data.data && data.data.qr_codes) ? data.data.qr_codes : [];
         if (files.length) {
           showQrImages(files);
-          addVerifyButton(selectedMode);
+          addVerifyButton('qr');
         }
         if (data.data && data.data.text) {
-          // Append text result under status
           const p = document.createElement('p');
           p.style.color = '#fff';
           p.textContent = data.data.text;
           statusDiv.insertAdjacentElement('afterend', p);
         }
-        console.log('Claude output:', data.output_text);
+        setStatus('QR ready. Click Verify when ready.', 'rgba(0,255,0,0.2)');
+      } else if (selectedMode === 'gesture' || selectedMode === 'object') {
+        setStatus('Preparing detector...', 'rgba(255,255,255,0.1)');
+        await runValidate(selectedMode, prompt);
+      } else {
+        setStatus('Done.', 'rgba(0,255,0,0.2)');
       }
     } catch (e) {
-      setStatus('Error: ' + e.message, 'rgba(255, 0, 0, 0.2)');
+      setStatus('Error: ' + e.message, 'rgba(255,0,0,0.2)');
     } finally {
       runButton.disabled = false;
+      if (reuseButton) reuseButton.disabled = false;
       spinner.style.display = 'none';
     }
   }
@@ -461,6 +746,11 @@
                 statusDiv.insertAdjacentElement('afterend', pre);
               }
 
+              // Refresh presets when job is done (new verified may be registered)
+              loadPresets();
+              if (selectedMode === 'gesture') { loadPresetsGroup('gesture'); }
+              if (selectedMode === 'object') { loadPresetsGroup('object'); }
+
               if (s.phase === 'error') {
                 setStatus('Error: detection failed. Please check camera/permissions.', 'rgba(255, 0, 0, 0.2)');
               } else if (s.phase === 'done') {
@@ -493,6 +783,8 @@
       setStatus('Error: ' + err.message, 'rgba(255, 0, 0, 0.2)');
     }
   }
+
+  
 
   // Enter key to submit
   promptInput.addEventListener('keypress', function (e) {
