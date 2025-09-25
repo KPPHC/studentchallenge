@@ -176,13 +176,11 @@ Finally, run the prepared Python script (or the reused script) to produce the ou
 
 ultrathink"""
         result, claude_session_id = run_claude(prompt)
-        print(claude_session_id)
 
         # After Claude runs, enumerate QR images and read the reference UUID if present
         qr_files = _list_recent_qr_images()
         uuid_text = None
         try:
-            ## TODO: error handling, when reference_uuid.json is malformed.
             if os.path.exists("reference_uuid.json"):
                 with open("reference_uuid.json", "r", encoding="utf-8") as f:
                     ref = json.load(f) or {}
@@ -218,11 +216,15 @@ def validate():
     mode = body.get('mode', mode)
     expected_override = body.get('expected', expected_override)
 
+    # Get user prompt from JSON body
+    user_prompt = body.get('prompt', '')
+
     script_name_map = {'qr': 'qr_runner.py', 'gesture': 'gesture_runner.py', 'object': 'object_runner.py'}
     script_path = os.path.join(os.getcwd(), script_name_map.get(mode, 'runner.py'))
 
     if mode == 'qr':
-        prompt = f"""Write (or reuse) a Python script saved exactly as: {script_path}
+        prompt = f"""
+\nWrite (or reuse) a Python script saved exactly as: {script_path}
 that captures a livestream from the device's webcam, scans its frames in real time, and detects the most probable QR code that appears in the stream.
 
 Before writing new code:
@@ -240,8 +242,9 @@ IMPORTANT: Do not run the script yourself; only write/update the file at the exa
 
 ultrathink"""
     elif mode == 'gesture':
-        prompt = f"""Write (or reuse) a Python script saved exactly as: {script_path}
-that uses MediaPipe to detect a thumbs-up gesture from the device's webcam in real time.
+        prompt = (user_prompt or "") + f"""
+\nWrite (or reuse) a Python script saved exactly as: {script_path}
+that uses MediaPipe to detect the user-specified gesture from the device's webcam in real time.
 
 Before writing new code:
 - Search the current project directory for existing gesture/hand detection scripts (files mentioning 'mediapipe', 'hands', 'gesture', 'thumb', etc.). Prefer reusing and minimally editing an existing script over creating a new one.
@@ -250,18 +253,20 @@ Before writing new code:
 The script must:
 - Depend on mediapipe and opencv-python; install only if missing.
 - Open the default webcam and process frames continuously.
-- Use MediaPipe Hands to detect hand landmarks. Consider a 'thumbs_up' gesture when the thumb tip is above the thumb IP joint and the other four fingertips are folded (y-coordinate greater than their respective PIP joints), with a stable detection over ~5 consecutive frames to reduce jitter.
-- When detected, print exactly: gesture thumbs_up
-- Save a JSON file named gesture_output.json containing at least: {{\"gesture\": \"thumbs_up\", \"verified\": true, \"confidence\": <float between 0 and 1>}}
-- Continue running for up to 15 seconds or until detection occurs; then exit.
+- Implement the gesture logic based on the user's prompt (e.g., hand landmarks configuration). Make the condition parametrizable so it can adapt to different gestures; avoid hardcoding a specific gesture name.
+- When the specified gesture is detected, print exactly one line: gesture <GESTURE_NAME>
+- Save a JSON file named gesture_output.json containing at least: {{\"gesture\": \"<GESTURE_NAME>\", \"verified\": true, \"confidence\": <float between 0 and 1>}}
+- Continue running for up to 20 seconds or until detection occurs; then exit.
 - Be resilient to missing webcam / install errors by printing a clear error and exiting non-zero.
 
 IMPORTANT: Do not run the script yourself; only write/update the file at the exact path above.
 
 ultrathink"""
+        print(prompt)
     elif mode == 'object':
-        prompt = f"""Write (or reuse) a Python script saved exactly as: {script_path}
-that uses YOLOv8 (ultralytics) to detect the most probable object from the device's webcam in real time.
+        prompt = (user_prompt or "") + f"""
+\nWrite (or reuse) a Python script saved exactly as: {script_path}
+that uses YOLOv8 (ultralytics) to detect the user-specified object from the device's webcam in real time.
 
 Before writing new code:
 - Search the current project directory for existing object detection scripts (files mentioning 'yolo', 'ultralytics', 'detect', etc.). Prefer reusing and minimally editing an existing script over creating a new one.
@@ -271,8 +276,8 @@ The script must:
 - Depend on ultralytics and opencv-python; install only if missing.
 - Load a lightweight pretrained YOLOv8 model (e.g., yolov8n.pt). If absent, download via ultralytics.
 - Open the default webcam and run inference on frames in real time.
-- Track the highest-confidence class observed in the last ~30 frames.
-- When confidence for a class exceeds 0.6 for at least 3 frames, print exactly one line to stdout: object <CLASS_NAME>
+- Track the highest-confidence class observed over a short sliding window (e.g., ~30 frames) and implement class matching per the user prompt.
+- When confidence for a class exceeds 0.6 for at least 3 frames and matches the user-specified target, print exactly one line: object <CLASS_NAME>
 - Save a JSON file named object_output.json containing at least: {{\"object\": \"<CLASS_NAME>\", \"verified\": true, \"confidence\": <float between 0 and 1>}}
 - Continue for up to 20 seconds or until detection occurs; then exit.
 - Be resilient to missing webcam / install errors by printing a clear error and exiting non-zero.

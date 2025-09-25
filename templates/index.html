@@ -224,19 +224,19 @@
     
     <script>
   // -------------------- Presets --------------------
-  // TODO: Change the prompts
+
   const PRESETS = {
     qr: {
       mode: 'qr',
-      prompt: "Write a Python script that creates a QR code image with a UUID. Save it as an image file 'qr_code.jpg'. Also save the same UUID into a text file (e.g., 'uuid.txt'). Ensure the script prints a line like: qr_code <UUID> to stdout."
+      prompt: "I want to verify myself using a QR code."
     },
     gesture: {
       mode: 'gesture',
-      prompt: "I will make a thumbs-up gesture. Build a system that captures from the webcam, detects this gesture reliably, and treats it as my verification. The script should print a line like: gesture thumbs_up and also save a JSON result."
+      prompt: "I want to verify myself with a specific gesture. The gesture is 'thumb up'."
     },
     object: {
       mode: 'object',
-      prompt: "I will present an apple to the camera. Build a system that captures from the webcam, detects the apple, and verifies me when it is recognized. The script should print a line like: object apple and also save a JSON result."
+      prompt: "I want to verify myself with a specific object. The object is 'apple'."
     }
   };
 
@@ -338,61 +338,68 @@
     spinner.style.display = 'block';
 
     try {
-      const response = await fetch(`/generate?mode=${encodeURIComponent(selectedMode)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-        body: prompt
-      });
-      const data = await response.json();
-      currentSessionId = data.session_id || null;
-
       if (selectedMode === 'gesture' || selectedMode === 'object') {
-        if (data.stream_url) {
-          qrContainer.style.display = 'none';
-          const url = `${data.stream_url}?sid=${encodeURIComponent(data.session_id || '')}&t=${Date.now()}`;
-          liveImg.src = url;
-          liveContainer.style.display = 'block';
-        } else {
-          liveContainer.style.display = 'none';
-          liveImg.src = '';
+        // Gesture/Object: hit /generate FIRST to initialize live feed on server, then /validate
+        setStatus('Preparing detector...', 'rgba(255, 255, 255, 0.1)');
+        const genRes = await fetch(`/generate?mode=${encodeURIComponent(selectedMode)}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+          body: prompt
+        });
+        const genData = await genRes.json();
+        currentSessionId = genData.session_id || null;
+
+        // Show live feed (prefer returned stream_url, fallback to /video_feed)
+        const streamUrl = (genData.stream_url || '/video_feed') + `?t=${Date.now()}`;
+        qrContainer.style.display = 'none';
+        liveImg.src = streamUrl;
+        liveContainer.style.display = 'block';
+
+        if (!genRes.ok) {
+          setStatus('Error during generate: ' + (genData.error || 'Unknown error'), 'rgba(255, 0, 0, 0.2)');
+          return;
         }
 
-        // Kick off validation; UI instructions will switch when script signals READY via /job-status
-        runValidate(selectedMode);
+        // Immediately kick off validation; READY/DETECTED/ERROR will be handled via polling in runValidate
+        await runValidate(selectedMode, prompt);
       } else {
         // Non-live modes (e.g., QR)
+        const response = await fetch(`/generate?mode=${encodeURIComponent(selectedMode)}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+          body: prompt
+        });
+        const data = await response.json();
+        currentSessionId = data.session_id || null;
         liveContainer.style.display = 'none';
         liveImg.src = '';
-      }
 
-      if (!response.ok) {
-        setStatus('Error: ' + (data.error || 'Unknown error'), 'rgba(255, 0, 0, 0.2)');
-        return;
-      }
+        if (!response.ok) {
+          setStatus('Error: ' + (data.error || 'Unknown error'), 'rgba(255, 0, 0, 0.2)');
+          return;
+        }
 
-      if (data.errors && data.errors.length) {
-        setStatus('Completed with warnings: ' + data.errors.join('; '));
-      } else {
-        setStatus('Generation finished successfully!', 'rgba(0, 255, 0, 0.2)');
-      }
+        if (data.errors && data.errors.length) {
+          setStatus('Completed with warnings: ' + data.errors.join('; '));
+        } else {
+          setStatus('Generation finished successfully!', 'rgba(0, 255, 0, 0.2)');
+        }
 
-      // Render results
-    
-      const files = (data.data && data.data.qr_codes) ? data.data.qr_codes : [];
-      if (files.length) {
-        showQrImages(files);
-        addVerifyButton(selectedMode);
+        // Render results
+        const files = (data.data && data.data.qr_codes) ? data.data.qr_codes : [];
+        if (files.length) {
+          showQrImages(files);
+          addVerifyButton(selectedMode);
+        }
+        if (data.data && data.data.text) {
+          // Append text result under status
+          const p = document.createElement('p');
+          p.style.color = '#fff';
+          p.textContent = data.data.text;
+          statusDiv.insertAdjacentElement('afterend', p);
+        }
+        console.log('Claude output:', data.output_text);
       }
-
-      if (data.data && data.data.text) {
-        // Append text result under status
-        const p = document.createElement('p');
-        p.style.color = '#fff';
-        p.textContent = data.data.text;
-        statusDiv.insertAdjacentElement('afterend', p);
-      }
-
-      console.log('Claude output:', data.output_text);
     } catch (e) {
       setStatus('Error: ' + e.message, 'rgba(255, 0, 0, 0.2)');
     } finally {
@@ -401,10 +408,11 @@
     }
   }
 
-  async function runValidate(mode) {
+  async function runValidate(mode, prompt) {
     try {
       setStatus('Validating...', 'rgba(255, 255, 255, 0.1)');
       const payload = {
+        prompt: prompt,
         mode: mode,
         session_id: currentSessionId || null
       };
