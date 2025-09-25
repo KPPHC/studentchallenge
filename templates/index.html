@@ -346,13 +346,31 @@
       const data = await response.json();
       currentSessionId = data.session_id || null;
 
-      if ((selectedMode === 'gesture' || selectedMode === 'object') && data.stream_url) {
-        qrContainer.style.display = 'none';
-        // cache-bust to keep it fresh; also pass session_id if you like
-        const url = `${data.stream_url}?sid=${encodeURIComponent(data.session_id || '')}&t=${Date.now()}`;
-        liveImg.src = url;
-        liveContainer.style.display = 'block';
+      if (selectedMode === 'gesture' || selectedMode === 'object') {
+        if (data.stream_url) {
+          qrContainer.style.display = 'none';
+          const url = `${data.stream_url}?sid=${encodeURIComponent(data.session_id || '')}&t=${Date.now()}`;
+          liveImg.src = url;
+          liveContainer.style.display = 'block';
+        } else {
+          liveContainer.style.display = 'none';
+          liveImg.src = '';
+        }
+
+        // Automatically trigger validate and show instructions (single place)
+        runValidate(selectedMode);
+        const existingInstruction = document.getElementById('live-instruction');
+        if (existingInstruction) existingInstruction.remove();
+        const instruction = document.createElement('p');
+        instruction.id = 'live-instruction';
+        instruction.style.color = '#fff';
+        instruction.style.marginTop = '0.5rem';
+        instruction.textContent = selectedMode === 'gesture'
+          ? 'Start your gesture in front of the camera...'
+          : 'Show the object to the camera...';
+        statusDiv.insertAdjacentElement('afterend', instruction);
       } else {
+        // Non-live modes (e.g., QR)
         liveContainer.style.display = 'none';
         liveImg.src = '';
       }
@@ -369,6 +387,7 @@
       }
 
       // Render results
+    
       const files = (data.data && data.data.qr_codes) ? data.data.qr_codes : [];
       if (files.length) {
         showQrImages(files);

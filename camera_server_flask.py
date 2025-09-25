@@ -2,6 +2,9 @@ import os
 import shutil
 import subprocess
 import base64
+import sys
+import uuid
+import json
 from flask import Flask, request, send_file, render_template, jsonify
 from pathlib import Path
 import re
@@ -40,13 +43,7 @@ def _list_recent_qr_images() -> List[str]:
                 recent.append(file.name)
     return recent
 
-def _extract_by_key(text: str, key: str) -> Optional[str]:
-    if not isinstance(text, str):
-        return None
-    # patterns: "key <VALUE>", "key: VALUE", "key=VALUE", optional quotes
-    m = re.search(rf"{re.escape(key)}\s*[:=]?\s*[\"']?([A-Za-z0-9_.\-]+)[\"']?", text, re.IGNORECASE)
-    return m.group(1) if m else None
-
+# Small helper to standardize API responses
 def _json_response(kind: str, output: str, data: Dict[str, Any], errors: List[str] = None, session_id: Optional[str] = None):
     return jsonify({
         "session_id": session_id,
@@ -55,42 +52,6 @@ def _json_response(kind: str, output: str, data: Dict[str, Any], errors: List[st
         "data": data,
         "errors": errors or []
     })
-
-def _parse_claude_output(raw: str, key: Optional[str] = None):
-    """Parse Claude CLI JSON (if any), extract session_id, key value, and boolean verified.
-    Returns (extracted_val, boolean_verified, session_id)."""
-    session_id = None
-    extracted_val = None
-    boolean_verified = None
-    try:
-        import json
-        parsed = json.loads(raw)
-        # session id
-        session_id = (
-            (parsed.get('session_id') if isinstance(parsed, dict) else None) or
-            ((parsed.get('meta') or {}).get('session_id') if isinstance(parsed, dict) else None) or
-            ((parsed.get('data') or {}).get('session_id') if isinstance(parsed, dict) else None) or
-            ((parsed.get('output') or {}).get('session_id') if isinstance(parsed, dict) else None)
-        )
-        # extract value by key
-        if key and isinstance(parsed, dict):
-            if key in parsed:
-                extracted_val = parsed.get(key)
-            else:
-                for container_key in ('result', 'data', 'output'):
-                    container = parsed.get(container_key) or {}
-                    if isinstance(container, dict) and key in container:
-                        extracted_val = container.get(key)
-                        break
-        # script-reported boolean verified
-        if isinstance(parsed, dict) and 'verified' in parsed:
-            boolean_verified = bool(parsed.get('verified'))
-    except Exception:
-        parsed = None
-    # fallback to regex when needed
-    if extracted_val is None and key:
-        extracted_val = _extract_by_key(raw, key)
-    return extracted_val, boolean_verified, session_id
 
 @app.route('/')
 def index():
@@ -115,12 +76,44 @@ def generate():
     print(f"Prompt: {prompt}")
     print(f"{'='*50}\n")
 
-    if not prompt:
-        return jsonify({"error": "No prompt provided"}), 400
 
-    #TODO: Make sure the video feed timing makes sense.
-    #Currently, when user presses 'Generate', the video feed starts.
-    if mode in ('gesture', 'object'):
+    if mode == 'qr':
+        prompt += """Generate a new random UUID and prepare files for a QR verification workflow.
+
+Before writing new code:
+- Search the current project directory for existing Python scripts or notebooks that already generate QR codes and/or UUID files (e.g., names containing 'qr', 'uuid', 'reference'). Prefer reusing or minimally editing an existing script over creating a new one.
+- Only generate a new script if no suitable existing code is found. If you modify an existing file, keep its name.
+
+Requirements:
+- Create (or overwrite) a file named reference_uuid.json in the current working directory with JSON content: {\"uuid\": \"<GENERATED_UUID>\"}.
+- Create (or overwrite) a QR code image file named qr_image.jpeg (JPEG) that encodes exactly the same <GENERATED_UUID> string.
+- Use Python. If libraries are missing, install them programmatically (e.g., qrcode[pil], pillow). Avoid reinstalling if already present.
+- On completion, print a single line to stdout in the exact format: qr_ready <GENERATED_UUID>
+
+Finally, run the prepared Python script (or the reused script) to produce the outputs.
+
+ultrathink"""
+        result, claude_session_id = run_claude(prompt)
+        print(claude_session_id)
+
+        # After Claude runs, enumerate QR images and read the reference UUID if present
+        qr_files = _list_recent_qr_images()
+        uuid_text = None
+        try:
+            ## TODO: error handling, when reference_uuid.json is malformed.
+            if os.path.exists("reference_uuid.json"):
+                with open("reference_uuid.json", "r", encoding="utf-8") as f:
+                    ref = json.load(f) or {}
+                    uuid_text = ref.get("uuid")
+        except Exception:
+            uuid_text = None
+
+        data = {"qr_codes": qr_files}
+
+        return _json_response('qr', result, data, session_id=claude_session_id)
+
+    elif mode in ('gesture', 'object'):
+        # For live modes, immediately show the camera stream in the client UI
         return jsonify({
             "session_id": None,
             "kind": "live",
@@ -130,30 +123,6 @@ def generate():
             "stream_url": "/video_feed"
         }), 200
 
-    result = run_claude(prompt)
-
-    # Try to parse session id and possible values from the output
-    qr_code_value, _, session_id = _parse_claude_output(result, 'qr_code')
-    fallback_text_value, _, _ = _parse_claude_output(result, 'text') if not qr_code_value else (None, None, None)
-
-    qr_files = _list_recent_qr_images()
-
-    response_kind = 'mixed'
-    display_text = None
-
-    if qr_files or qr_code_value:
-        response_kind = 'qr'
-        display_text = qr_code_value or fallback_text_value
-    elif fallback_text_value:
-        response_kind = 'text'
-        display_text = fallback_text_value
-
-    data = {"qr_codes": qr_files}
-    if display_text:
-        data["text"] = display_text
-
-    return _json_response(response_kind, result, data, session_id=session_id)
-
 @app.route('/validate', methods=['POST'])
 def validate():
     mode = request.args.get('mode', 'qr')
@@ -161,117 +130,138 @@ def validate():
 
     # Accept session_id via query or JSON body (POST)
     provided_session_id = request.args.get('session_id')
-    print(provided_session_id)
     body = request.get_json(silent=True) or {}
     provided_session_id = body.get('session_id', provided_session_id)
     # allow body to override mode/expected if provided
     mode = body.get('mode', mode)
     expected_override = body.get('expected', expected_override)
 
-## TODO: Change the prompts
     if mode == 'qr':
-        prompt = """Write a Python script that captures a 10 second video file from this devices webcamera (e.g., input.mp4), scans its frames, and detects the most probable QR code that appears in the video, and saves the QR code as a JSON file.
-The JSON output filepath is 'C:\\Users\\post97\\OneDrive - Tartu Ülikool\\PycharmProjects\\studentchallenge\\output.json'.
+        prompt = """Write (or reuse) a Python script that captures a livestream from the device's webcam, scans its frames in real time, and detects the most probable QR code that appears in the stream.
 
-Requirements: 
-1. Output the result as a JSON file to standard output, like this qr_code <QR_CODE_CONTENT>
-2. Run the created Python script.
-3. Python script saves output as JSON file.
-
-ultrathink"""
-    
-    elif mode == 'gesture':
-        prompt = """Run the thumbs_up_detector.py script to detect thumbs-up gestures from the webcam. The script will capture video, detect the gesture, print 'gesture thumbs_up' when detected, and save results to output.json.
+Before writing new code:
+- Search the current project directory for existing QR detection scripts or utilities (files whose names or contents mention 'qr', 'detect', 'zbar', 'pyzbar', 'opencv', etc.). Prefer reusing and minimally editing an existing script over creating a new one.
+- Only create a new file if no suitable script exists.
 
 Requirements:
-1. Execute the existing thumbs_up_detector.py script
-2. The script outputs 'gesture thumbs_up' to stdout when detected
-3. Results are saved to output.json with verification status
+- When a QR is detected, print a single line to stdout in the exact format: qr_code <QR_CODE_CONTENT>
+- Save a JSON file named uuid.json in the current working directory with JSON content: {\"uuid\": <QR_CODE_CONTENT>}
+- Exit non-zero with a clear message on failure.
+- The script should stop after successful detection or after ~15 seconds.
+- Use Python. If dependencies (e.g., opencv-python, pyzbar, numpy, pillow) are missing, install them programmatically; skip install if already available.
+
+Finally, run the script (reused or newly created) to produce uuid.json.
+
+ultrathink"""
+    ## TODO: split 
+    elif mode == 'gesture':
+        prompt = """Write (or reuse) and run a Python script that uses MediaPipe to detect a thumbs-up gesture from the device's webcam in real time.
+
+Before writing new code:
+- Search the current project directory for existing gesture/hand detection scripts (files mentioning 'mediapipe', 'hands', 'gesture', 'thumb', etc.). Prefer reusing and minimally editing an existing script over creating a new one.
+- Only create a new file if no suitable script exists.
+
+The script must:
+- Depend on mediapipe and opencv-python; install only if missing.
+- Open the default webcam and process frames continuously.
+- Use MediaPipe Hands to detect hand landmarks. Consider a 'thumbs_up' gesture when the thumb tip is above the thumb IP joint and the other four fingertips are folded (y-coordinate greater than their respective PIP joints), with a stable detection over ~5 consecutive frames to reduce jitter.
+- When detected, print exactly: gesture thumbs_up
+- Save a JSON file named gesture_output.json containing at least: {\"gesture\": \"thumbs_up\", \"verified\": true, \"confidence\": <float between 0 and 1>}
+- Continue running for up to 15 seconds or until detection occurs; then exit.
+- Be resilient to missing webcam / install errors by printing a clear error and exiting non-zero.
+
+Finally, run the prepared (or reused) Python script.
+
+ultrathink"""
+    elif mode == 'object':
+        prompt = """Write (or reuse) and run a Python script that uses YOLOv8 (ultralytics) to detect the most probable object from the device's webcam in real time.
+
+Before writing new code:
+- Search the current project directory for existing object detection scripts (files mentioning 'yolo', 'ultralytics', 'detect', etc.). Prefer reusing and minimally editing an existing script over creating a new one.
+- Only create a new file if no suitable script exists.
+
+The script must:
+- Depend on ultralytics and opencv-python; install only if missing.
+- Load a lightweight pretrained YOLOv8 model (e.g., yolov8n.pt). If absent, download via ultralytics.
+- Open the default webcam and run inference on frames in real time.
+- Track the highest-confidence class observed in the last ~30 frames.
+- When confidence for a class exceeds 0.6 for at least 3 frames, print exactly one line to stdout: object <CLASS_NAME>
+- Save a JSON file named object_output.json containing at least: {\"object\": \"<CLASS_NAME>\", \"verified\": true, \"confidence\": <float between 0 and 1>}
+- Continue for up to 20 seconds or until detection occurs; then exit.
+- Be resilient to missing webcam / install errors by printing a clear error and exiting non-zero.
+
+Finally, run the prepared (or reused) Python script.
 
 ultrathink"""
 
-    elif mode == 'object':
-        session_id = provided_session_id
-        SESSIONS.setdefault(session_id, {"mode": mode, "video_path": None})
-        return jsonify({
-            "status": "ready",
-            "message": f"{mode.capitalize()} mode ready. Live camera stream available.",
-            "session_id": session_id,
-            "stream_url": "/video_feed"
-        }), 200
-#     elif mode == 'object':
-#         prompt = """Write a Python script that captures a short video or frame from the device's webcam, detects the most probable object, and outputs a line like 'object <NAME>' to stdout and saves the result to a JSON file.
+    # Define canonical output file per mode
+    filename_map = {'qr': 'uuid.json', 'gesture': 'gesture_output.json', 'object': 'object_output.json'}
+    canonical_file = filename_map.get(mode, 'output.json')
 
-# Requirements:
-# 1. Output the object detection result as a JSON file to standard output.
-# 2. Run the created Python script.
+    # Run Claude to generate & run the detector (for qr/gesture/object)
+    raw_result, claude_session_id = run_claude(prompt, session_id=provided_session_id)
+    print(raw_result)
 
-# ultrathink"""
-#     else:
-#         return jsonify({"error": f"Unsupported mode: {mode}"}), 400
+    # Read produced JSON file
+    file_payload = {}
+    try:
+        if os.path.exists(canonical_file):
+            with open(canonical_file, "r", encoding="utf-8") as f:
+                file_payload = json.load(f) or {}
+    except Exception as e:
+        file_payload = {}
 
-## TODO: When it's object detection, gesture detection, validation step skipped. Check it. 
-## maybe in the generate step, claude is now running the code and return the result. 
-## but we want to align the step. change the UI and let the user push the start button. 
-## can we somehow feed the live-streaming video there?  
+    # Determine verified
+    boolean_verified = False
+    extracted_val = None
 
-
-    # Run Claude (resume if session_id provided)
-    raw_result = run_claude(prompt, session_id=provided_session_id)
-
-    # Parse output uniformly
-    key_map = {'qr': 'qr_code', 'gesture': 'gesture', 'object': 'object'}
-    key = key_map.get(mode)
-    extracted_val, boolean_verified, parsed_session_id = _parse_claude_output(raw_result, key)
-
-    # Prefer provided session id; otherwise use parsed
-    session_id = provided_session_id or parsed_session_id
-
-    # Determine expected value
-    expected_val = None
-    if expected_override:
-        expected_val = expected_override.strip()
     if mode == 'qr':
-        if os.path.exists("uuid.txt"):
-            with open("uuid.txt", "r", encoding='utf-8') as f:
-                expected_val = f.read().strip()
+        # Compare uuid.json against reference_uuid.json
+        try:
+            detected_uuid = file_payload.get('uuid')
+            extracted_val = detected_uuid
+            with open('reference_uuid.json', 'r', encoding='utf-8') as rf:
+                ref = json.load(rf) or {}
+            ref_uuid = ref.get('uuid')
+            boolean_verified = bool(detected_uuid and ref_uuid and str(detected_uuid) == str(ref_uuid))
+        except Exception:
+            boolean_verified = False
+    elif mode in ('gesture', 'object'):
+        # Trust the script's verified flag; default False
+        if isinstance(file_payload, dict) and 'verified' in file_payload:
+            try:
+                boolean_verified = bool(file_payload.get('verified'))
+            except Exception:
+                boolean_verified = False
+        # Extract value for UI
+        key_map = {'gesture': 'gesture', 'object': 'object'}
+        key = key_map.get(mode)
+        if key and key in file_payload:
+            extracted_val = file_payload.get(key)
 
-    # Verification policy:
-    # 1) If boolean 'verified' provided by the script, respect it unless an explicit expected is provided (then must match too).
-    # 2) If expected provided, require equality with extracted value.
-    # 3) Otherwise, presence of a non-empty extracted value counts as success.
-    verified = False
-    reason = ""
-
-    if expected_val:
-        verified = (extracted_val is not None and str(extracted_val).strip() == expected_val)
-        reason = f"Compared extracted {key} '{extracted_val}' with expected '{expected_val}'."
-        if boolean_verified is not None:
-            reason += f" Script-reported verified={boolean_verified}."
-    else:
-        if boolean_verified is not None:
-            verified = bool(boolean_verified)
-            reason = f"Script reported verified={boolean_verified}."
-            if extracted_val:
-                reason += f" Extracted {key}='{extracted_val}'."
-        else:
-            verified = bool(extracted_val)
-            reason = (f"No expected value provided; found {key} '{extracted_val}'."
-                      if extracted_val else f"No expected value provided and no {key} found.")
-
+    # Build data payload
     data = {}
-    if extracted_val is not None and key:
-        data[key] = extracted_val
-    if mode == 'qr':
-        data["qr_codes"] = _list_recent_qr_images()
+    if extracted_val is not None:
+        if mode == 'qr':
+            data['qr_code'] = extracted_val
+        elif mode == 'gesture':
+            data['gesture'] = extracted_val
+        elif mode == 'object':
+            data['object'] = extracted_val
+
+    # Also merge everything from the file for transparency
+    if isinstance(file_payload, dict):
+        for k, v in file_payload.items():
+            if k not in data or data[k] in (None, ""):
+                data[k] = v
 
     response = {
-        "verified": verified,
-        "reason": reason,
-        "session_id": session_id,
+        "verified": boolean_verified,
+        "session_id": provided_session_id,
         "data": data,
         "errors": []
     }
+    response["session_id"] = claude_session_id or provided_session_id
 
     return jsonify(response)
 
@@ -281,26 +271,19 @@ def recognize_qr_image():#
     with app.test_request_context('/validate?mode=qr'):
         return validate()
 
-def run_claude(prompt: str, cwd: str = ".", session_id=None) -> str:
+def run_claude(prompt: str, cwd: str = ".", session_id=None):
     """
     Run Claude Code CLI with a given prompt.
-    
-    Args:
-        prompt: The text to send to Claude Code.
-        cwd: Directory where the codebase is (Claude runs in that context).
-    
-    Returns:
-        Claude's output as a string.
-    """
 
+    Returns a tuple: (stdout_text, session_id_str or None)
+    """
     exe = shutil.which("claude")
     args = [exe, "--output-format", "json"]
     if session_id:
         args += ["-r", session_id]
     args.append(prompt)
- 
+
     try:
-        #r"C:\Users\post97\AppData\Roaming\npm\claude.cmd       
         result = subprocess.run(
             args,
             cwd=cwd,
@@ -308,9 +291,23 @@ def run_claude(prompt: str, cwd: str = ".", session_id=None) -> str:
             text=True,
             check=True
         )
-        return result.stdout
+        stdout = result.stdout
+        # Try best-effort parse to extract session_id
+        sid = None
+        try:
+            parsed = json.loads(stdout)
+            if isinstance(parsed, dict):
+                sid = (
+                    parsed.get('session_id')
+                    or (parsed.get('meta') or {}).get('session_id')
+                    or (parsed.get('data') or {}).get('session_id')
+                    or (parsed.get('output') or {}).get('session_id')
+                )
+        except Exception:
+            sid = None
+        return stdout, sid
     except subprocess.CalledProcessError as e:
-        return f"Error: {e.stderr}"
+        return f"Error: {e.stderr}", None
 
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, debug=False)
