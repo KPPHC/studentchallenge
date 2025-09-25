@@ -357,18 +357,8 @@
           liveImg.src = '';
         }
 
-        // Automatically trigger validate and show instructions (single place)
+        // Kick off validation; UI instructions will switch when script signals READY via /job-status
         runValidate(selectedMode);
-        const existingInstruction = document.getElementById('live-instruction');
-        if (existingInstruction) existingInstruction.remove();
-        const instruction = document.createElement('p');
-        instruction.id = 'live-instruction';
-        instruction.style.color = '#fff';
-        instruction.style.marginTop = '0.5rem';
-        instruction.textContent = selectedMode === 'gesture'
-          ? 'Start your gesture in front of the camera...'
-          : 'Show the object to the camera...';
-        statusDiv.insertAdjacentElement('afterend', instruction);
       } else {
         // Non-live modes (e.g., QR)
         liveContainer.style.display = 'none';
@@ -423,6 +413,67 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
+
+      // If async job accepted, start polling job status
+      if (res.status === 202) {
+        const { job_id, poll_url } = await res.json();
+        if (window.__jobPoll) clearInterval(window.__jobPoll);
+        window.__jobPoll = setInterval(async () => {
+          try {
+            const r = await fetch(poll_url, { cache: 'no-store' });
+            const s = await r.json();
+            // Update status banner with phase
+            setStatus(`Phase: ${s.phase || 'unknown'}`, 'rgba(255, 255, 255, 0.08)');
+
+            if (s.phase === 'ready') {
+              // Switch instructions exactly when the script actually starts running
+              const existingInstruction = document.getElementById('live-instruction');
+              if (existingInstruction) existingInstruction.remove();
+              const instruction = document.createElement('p');
+              instruction.id = 'live-instruction';
+              instruction.style.color = '#fff';
+              instruction.style.marginTop = '0.5rem';
+              instruction.textContent = mode === 'gesture'
+                ? 'Start your gesture in front of the camera...'
+                : (mode === 'object' ? 'Show the object to the camera...' : 'Scanning...');
+              statusDiv.insertAdjacentElement('afterend', instruction);
+            }
+
+            if (s.phase === 'detected' || s.phase === 'done' || s.phase === 'error') {
+              clearInterval(window.__jobPoll);
+
+              // Show results, if any
+              if (s.data) {
+                const pre = document.createElement('pre');
+                pre.style.color = '#ddd';
+                pre.style.background = 'rgba(255,255,255,0.06)';
+                pre.style.padding = '8px';
+                pre.style.borderRadius = '6px';
+                pre.textContent = JSON.stringify(s.data, null, 2);
+                statusDiv.insertAdjacentElement('afterend', pre);
+              }
+
+              if (s.phase === 'error') {
+                setStatus('Error: detection failed. Please check camera/permissions.', 'rgba(255, 0, 0, 0.2)');
+              } else if (s.phase === 'done') {
+                const verified = (s.data && typeof s.data.verified !== 'undefined') ? s.data.verified : (s.verified || false);
+                if (verified) {
+                  setStatus('Verified!', 'rgba(0, 255, 0, 0.2)');
+                } else {
+                  setStatus('Completed. No verification.', 'rgba(255, 255, 255, 0.1)');
+                }
+              } else {
+                setStatus('Detected!', 'rgba(0, 255, 0, 0.2)');
+              }
+            }
+          } catch (err) {
+            console.error('Job poll error', err);
+          }
+        }, 1000);
+        return; // polling will drive further UI updates
+      }
+
+      // Fallback: synchronous response (if server returns 200 with a result)
       const result = await res.json();
       if (res.ok && result.verified) {
         setStatus('Verified!', 'rgba(0, 255, 0, 0.2)');

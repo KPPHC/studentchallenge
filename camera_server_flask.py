@@ -11,12 +11,18 @@ import re
 from typing import Dict, Any, List, Optional
 from werkzeug.utils import secure_filename
 from camera import register_camera_routes
+import threading
+import time
+from datetime import datetime
 
 app = Flask(__name__)
 register_camera_routes(app)
 
 HOST = "0.0.0.0"
 PORT = 8080
+
+JOBS_DIR = os.path.join(os.getcwd(), "jobs")
+os.makedirs(JOBS_DIR, exist_ok=True)
 
 
 SESSIONS = {}  # {session_id: {"mode": "gesture"|"object", "video_path": str|None}}
@@ -52,6 +58,82 @@ def _json_response(kind: str, output: str, data: Dict[str, Any], errors: List[st
         "data": data,
         "errors": errors or []
     })
+
+def _job_dir(job_id: str) -> str:
+    d = os.path.join(JOBS_DIR, job_id)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _write_json(path: str, payload: Dict[str, Any]):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+def _read_job_status(job_id: str) -> Dict[str, Any]:
+    d = _job_dir(job_id)
+    status_path = os.path.join(d, "status.json")
+    script_status_path = os.path.join(d, "script_status.json")
+    result_files = {
+        'qr': 'uuid.json',
+        'gesture': 'gesture_output.json',
+        'object': 'object_output.json'
+    }
+    status = {"job_id": job_id, "phase": "queued", "updated_at": datetime.utcnow().isoformat() + "Z"}
+    # status.json (written by background thread)
+    try:
+        if os.path.exists(status_path):
+            with open(status_path, "r", encoding="utf-8") as f:
+                s = json.load(f) or {}
+                status.update(s)
+    except Exception:
+        pass
+    # script_status.json (written by generated script)
+    try:
+        if os.path.exists(script_status_path):
+            with open(script_status_path, "r", encoding="utf-8") as f:
+                s = json.load(f) or {}
+                status.update(s)
+    except Exception:
+        pass
+    # merge result json if present
+    for fname in result_files.values():
+        try:
+            p = os.path.join(os.getcwd(), fname)
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    r = json.load(f) or {}
+                    if isinstance(r, dict):
+                        status.setdefault('data', {})
+                        for k, v in r.items():
+                            if k not in status['data']:
+                                status['data'][k] = v
+        except Exception:
+            pass
+    return status
+
+def _run_claude_background(prompt: str, job_id: str, session_id: Optional[str], mode: str, script_path: str):
+    d = _job_dir(job_id)
+    log_path = os.path.join(d, "claude.log")
+    status_path = os.path.join(d, "status.json")
+    _write_json(status_path, {"phase": "generating"})
+    stdout, sid = run_claude(prompt, session_id=session_id)
+    # write Claude generation log
+    try:
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(stdout or "")
+    except Exception:
+        pass
+
+    # After code generation, launch the generated script ourselves (unbuffered)
+    try:
+        proc_log_path = os.path.join(d, "script.log")
+        proc_out = open(proc_log_path, "w", encoding="utf-8")
+        proc = subprocess.Popen([sys.executable, "-u", script_path], stdout=proc_out, stderr=subprocess.STDOUT)
+        _write_json(status_path, {"phase": "running", "session_id": sid or session_id, "pid": proc.pid, "script": script_path, "mode": mode})
+    except Exception as e:
+        _write_json(status_path, {"phase": "error", "message": f"Failed to start script: {e}"})
 
 @app.route('/')
 def index():
@@ -136,49 +218,54 @@ def validate():
     mode = body.get('mode', mode)
     expected_override = body.get('expected', expected_override)
 
+    script_name_map = {'qr': 'qr_runner.py', 'gesture': 'gesture_runner.py', 'object': 'object_runner.py'}
+    script_path = os.path.join(os.getcwd(), script_name_map.get(mode, 'runner.py'))
+
     if mode == 'qr':
-        prompt = """Write (or reuse) a Python script that captures a livestream from the device's webcam, scans its frames in real time, and detects the most probable QR code that appears in the stream.
+        prompt = f"""Write (or reuse) a Python script saved exactly as: {script_path}
+that captures a livestream from the device's webcam, scans its frames in real time, and detects the most probable QR code that appears in the stream.
 
 Before writing new code:
 - Search the current project directory for existing QR detection scripts or utilities (files whose names or contents mention 'qr', 'detect', 'zbar', 'pyzbar', 'opencv', etc.). Prefer reusing and minimally editing an existing script over creating a new one.
-- Only create a new file if no suitable script exists.
+- Only create a new file if no suitable script exists. If modifying, keep the filename exactly as above.
 
 Requirements:
 - When a QR is detected, print a single line to stdout in the exact format: qr_code <QR_CODE_CONTENT>
-- Save a JSON file named uuid.json in the current working directory with JSON content: {\"uuid\": <QR_CODE_CONTENT>}
+- Save a JSON file named uuid.json in the current working directory with JSON content: {{\"uuid\": <QR_CODE_CONTENT>}}
 - Exit non-zero with a clear message on failure.
 - The script should stop after successful detection or after ~15 seconds.
 - Use Python. If dependencies (e.g., opencv-python, pyzbar, numpy, pillow) are missing, install them programmatically; skip install if already available.
 
-Finally, run the script (reused or newly created) to produce uuid.json.
+IMPORTANT: Do not run the script yourself; only write/update the file at the exact path above.
 
 ultrathink"""
-    ## TODO: split 
     elif mode == 'gesture':
-        prompt = """Write (or reuse) and run a Python script that uses MediaPipe to detect a thumbs-up gesture from the device's webcam in real time.
+        prompt = f"""Write (or reuse) a Python script saved exactly as: {script_path}
+that uses MediaPipe to detect a thumbs-up gesture from the device's webcam in real time.
 
 Before writing new code:
 - Search the current project directory for existing gesture/hand detection scripts (files mentioning 'mediapipe', 'hands', 'gesture', 'thumb', etc.). Prefer reusing and minimally editing an existing script over creating a new one.
-- Only create a new file if no suitable script exists.
+- Only create a new file if no suitable script exists. If modifying, keep the filename exactly as above.
 
 The script must:
 - Depend on mediapipe and opencv-python; install only if missing.
 - Open the default webcam and process frames continuously.
 - Use MediaPipe Hands to detect hand landmarks. Consider a 'thumbs_up' gesture when the thumb tip is above the thumb IP joint and the other four fingertips are folded (y-coordinate greater than their respective PIP joints), with a stable detection over ~5 consecutive frames to reduce jitter.
 - When detected, print exactly: gesture thumbs_up
-- Save a JSON file named gesture_output.json containing at least: {\"gesture\": \"thumbs_up\", \"verified\": true, \"confidence\": <float between 0 and 1>}
+- Save a JSON file named gesture_output.json containing at least: {{\"gesture\": \"thumbs_up\", \"verified\": true, \"confidence\": <float between 0 and 1>}}
 - Continue running for up to 15 seconds or until detection occurs; then exit.
 - Be resilient to missing webcam / install errors by printing a clear error and exiting non-zero.
 
-Finally, run the prepared (or reused) Python script.
+IMPORTANT: Do not run the script yourself; only write/update the file at the exact path above.
 
 ultrathink"""
     elif mode == 'object':
-        prompt = """Write (or reuse) and run a Python script that uses YOLOv8 (ultralytics) to detect the most probable object from the device's webcam in real time.
+        prompt = f"""Write (or reuse) a Python script saved exactly as: {script_path}
+that uses YOLOv8 (ultralytics) to detect the most probable object from the device's webcam in real time.
 
 Before writing new code:
 - Search the current project directory for existing object detection scripts (files mentioning 'yolo', 'ultralytics', 'detect', etc.). Prefer reusing and minimally editing an existing script over creating a new one.
-- Only create a new file if no suitable script exists.
+- Only create a new file if no suitable script exists. If modifying, keep the filename exactly as above.
 
 The script must:
 - Depend on ultralytics and opencv-python; install only if missing.
@@ -186,11 +273,11 @@ The script must:
 - Open the default webcam and run inference on frames in real time.
 - Track the highest-confidence class observed in the last ~30 frames.
 - When confidence for a class exceeds 0.6 for at least 3 frames, print exactly one line to stdout: object <CLASS_NAME>
-- Save a JSON file named object_output.json containing at least: {\"object\": \"<CLASS_NAME>\", \"verified\": true, \"confidence\": <float between 0 and 1>}
+- Save a JSON file named object_output.json containing at least: {{\"object\": \"<CLASS_NAME>\", \"verified\": true, \"confidence\": <float between 0 and 1>}}
 - Continue for up to 20 seconds or until detection occurs; then exit.
 - Be resilient to missing webcam / install errors by printing a clear error and exiting non-zero.
 
-Finally, run the prepared (or reused) Python script.
+IMPORTANT: Do not run the script yourself; only write/update the file at the exact path above.
 
 ultrathink"""
 
@@ -198,78 +285,52 @@ ultrathink"""
     filename_map = {'qr': 'uuid.json', 'gesture': 'gesture_output.json', 'object': 'object_output.json'}
     canonical_file = filename_map.get(mode, 'output.json')
 
-    # Run Claude to generate & run the detector (for qr/gesture/object)
-    raw_result, claude_session_id = run_claude(prompt, session_id=provided_session_id)
-    print(raw_result)
+    # Create async job and return immediately
+    job_id = str(uuid.uuid4())
+    d = _job_dir(job_id)
+    _write_json(os.path.join(d, "status.json"), {"phase": "queued"})
 
-    # Read produced JSON file
-    file_payload = {}
-    try:
-        if os.path.exists(canonical_file):
-            with open(canonical_file, "r", encoding="utf-8") as f:
-                file_payload = json.load(f) or {}
-    except Exception as e:
-        file_payload = {}
+    # Absolute path to job dir for the generated script to write hooks
+    job_dir_abs = d
 
-    # Determine verified
-    boolean_verified = False
-    extracted_val = None
+    # Inject hook instructions into the prompt for READY/DETECTED/DONE phases
+    hook_instructions = f"""
+\nHook requirements (DO NOT SKIP):
+- The server will execute the script at: {script_path}. Do NOT execute it yourself.
+- Ensure the script writes the following signals to "{job_dir_abs}/script_status.json":
+  * As soon as the webcam is opened and the main processing loop is about to start, do both:
+    1) print("PHASE READY", flush=True)
+    2) write JSON {{"phase":"ready"}}
+  * On successful detection, write JSON with details, e.g. for gesture: {{"phase":"detected","gesture":"thumbs_up","confidence": <0..1>}}
+    and also print the one-line stdout key (e.g., "gesture thumbs_up", "object <CLASS>", "qr_code <VALUE>") with flush=True.
+  * On normal finish, write {{"phase":"done","verified": <true|false>}}; on fatal error, write {{"phase":"error","message":"..."}} and exit non-zero.
+- All prints must use flush=True to avoid buffering.
+"""
+    prompt_with_hooks = prompt + hook_instructions
 
-    if mode == 'qr':
-        # Compare uuid.json against reference_uuid.json
-        try:
-            detected_uuid = file_payload.get('uuid')
-            extracted_val = detected_uuid
-            with open('reference_uuid.json', 'r', encoding='utf-8') as rf:
-                ref = json.load(rf) or {}
-            ref_uuid = ref.get('uuid')
-            boolean_verified = bool(detected_uuid and ref_uuid and str(detected_uuid) == str(ref_uuid))
-        except Exception:
-            boolean_verified = False
-    elif mode in ('gesture', 'object'):
-        # Trust the script's verified flag; default False
-        if isinstance(file_payload, dict) and 'verified' in file_payload:
-            try:
-                boolean_verified = bool(file_payload.get('verified'))
-            except Exception:
-                boolean_verified = False
-        # Extract value for UI
-        key_map = {'gesture': 'gesture', 'object': 'object'}
-        key = key_map.get(mode)
-        if key and key in file_payload:
-            extracted_val = file_payload.get(key)
+    t = threading.Thread(target=_run_claude_background, args=(prompt_with_hooks, job_id, provided_session_id, mode, script_path), daemon=True)
+    t.start()
 
-    # Build data payload
-    data = {}
-    if extracted_val is not None:
-        if mode == 'qr':
-            data['qr_code'] = extracted_val
-        elif mode == 'gesture':
-            data['gesture'] = extracted_val
-        elif mode == 'object':
-            data['object'] = extracted_val
-
-    # Also merge everything from the file for transparency
-    if isinstance(file_payload, dict):
-        for k, v in file_payload.items():
-            if k not in data or data[k] in (None, ""):
-                data[k] = v
-
-    response = {
-        "verified": boolean_verified,
+    return jsonify({
+        "status": "accepted",
+        "job_id": job_id,
         "session_id": provided_session_id,
-        "data": data,
-        "errors": []
-    }
-    response["session_id"] = claude_session_id or provided_session_id
-
-    return jsonify(response)
+        "poll_url": f"/job-status?job_id={job_id}"
+    }), 202
 
 @app.route('/recognize-qr-image', methods=['GET'])
 def recognize_qr_image():#
     # Deprecated alias → forwards to /validate (qr mode)
     with app.test_request_context('/validate?mode=qr'):
         return validate()
+
+@app.route('/job-status', methods=['GET'])
+def job_status():
+    job_id = request.args.get('job_id')
+    if not job_id:
+        return jsonify({"error": "job_id is required"}), 400
+    s = _read_job_status(job_id)
+    return jsonify(s)
 
 def run_claude(prompt: str, cwd: str = ".", session_id=None):
     """
