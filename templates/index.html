@@ -205,6 +205,7 @@
             </div>
             <textarea id="prompt" placeholder="Enter a prompt or choose a preset below..."></textarea>
             <button id="runButton" onclick="runGenerate()">Generate</button>
+            <button id="instantRunButton" title="Run with existing QR code (no generation)" style="display:none;">Instant Run</button>
             <!-- <button id="reuseButton" title="Run with existing code (no generation)">Instant Run</button> -->
             <div class="spinner" id="spinner"></div>
         </div>
@@ -259,6 +260,11 @@
   const runButton = document.getElementById('runButton');
   const spinner = document.getElementById('spinner');
   const promptInput = document.getElementById('prompt');
+  const instantRunButton = document.getElementById('instantRunButton');
+  function toggleInstantRunButton() {
+    if (!instantRunButton) return;
+    instantRunButton.style.display = (selectedMode === 'qr') ? 'inline-block' : 'none';
+  }
 
   // -------------------- UI helpers --------------------
   function setStatus(text, color = 'rgba(255, 255, 255, 0.1)') {
@@ -325,7 +331,7 @@
 }
 
 // Helper for Verify button in reuse path
-function addVerifyButtonInstant(mode) {
+function addVerifyButtonInstant(mode, script_name=null) {
     let verifyBtn = document.getElementById('verifyButtonReuse');
     if (!verifyBtn) {
       verifyBtn = document.createElement('button');
@@ -333,7 +339,7 @@ function addVerifyButtonInstant(mode) {
       verifyBtn.type = 'button';
       verifyBtn.textContent = 'Verify (Instant)';
       verifyBtn.style.marginTop = '0.5rem';
-      verifyBtn.addEventListener('click', () => runInstantValidate(mode));
+      verifyBtn.addEventListener('click', () => runInstantValidate(mode, script_name));
       qrContainer.appendChild(verifyBtn);
     }
     verifyBtn.style.display = 'inline-block';
@@ -425,7 +431,7 @@ function addVerifyButtonInstant(mode) {
       const res = await fetch('/instant-run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode, action: 'validate', scriptName: scriptName, prompt: lastUserPrompt || promptInput.value.trim() || '' })
+        body: JSON.stringify({ mode, action: 'validate', scriptName: scriptName})
       });
       if (res.status === 202) {
         const { job_id, poll_url } = await res.json();
@@ -460,9 +466,19 @@ function addVerifyButtonInstant(mode) {
               loadPresets();
               if (selectedMode === 'gesture') { loadPresetsGroup('gesture'); }
               if (selectedMode === 'object') { loadPresetsGroup('object'); }
-              if (s.phase === 'error') setStatus('Error: detection failed.', 'rgba(255,0,0,0.2)');
-              else if (s.phase === 'done') setStatus('Completed.', 'rgba(0,255,0,0.2)');
-              else setStatus('Detected!', 'rgba(0,255,0,0.2)');
+
+              if (s.phase === 'error') {
+                setStatus('Error: detection failed.', 'rgba(255,0,0,0.25)');
+              } else if (s.phase === 'done') {
+                const verified = (s.data && typeof s.data.verified !== 'undefined') ? s.data.verified : (s.verified || false);
+                if (verified) {
+                  setStatus('Verified!', 'rgba(0,255,0,0.25)');
+                } else {
+                  setStatus('Verification failed.', 'rgba(255,0,0,0.25)');
+                }
+              } else {
+                setStatus('Detected!', 'rgba(0,255,0,0.2)');
+              }
             }
           } catch (err) { console.error('reuse poll error', err); }
         }, 1000);
@@ -475,46 +491,46 @@ function addVerifyButtonInstant(mode) {
     }
   }
 
-  if (reuseButton) {
-    reuseButton.addEventListener('click', async () => {
-      const prompt = promptInput.value.trim();
-      lastUserPrompt = prompt;
-      if (!prompt) {
-        setStatus('Please enter a prompt or choose a preset', 'rgba(255,0,0,0.2)');
-        return;
-      }
-      clearResults();
-      setStatus('Using existing code...', 'rgba(255,255,255,0.1)');
-      // Initialize via /reuse generate
-      const genRes = await fetch('/instant-run', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: selectedMode, action: 'generate', prompt })
-      });
-      const genData = await genRes.json();
-      if (!genRes.ok) {
-        setStatus('Error: ' + (genData.error || 'Failed to initialize'), 'rgba(255,0,0,0.2)');
-        return;
-      }
-      // Show live feed always
-      const streamUrl = (genData.stream_url || '/video_feed') + `?t=${Date.now()}`;
-      liveImg.src = streamUrl;
-      liveContainer.style.display = 'block';
-      if (selectedMode === 'qr') {
-        const files = (genData.data && genData.data.qr_codes) ? genData.data.qr_codes : [];
-        if (files.length) { showQrImages(files); addVerifyButtonInstant(selectedMode); }
-        if (genData.data && genData.data.text) {
-          const p = document.createElement('p');
-          p.style.color = '#fff';
-          p.textContent = genData.data.text;
-          statusDiv.insertAdjacentElement('afterend', p);
-        }
-        setStatus('QR ready. Click Verify (Instant).', 'rgba(0,255,0,0.2)');
-        return;
-      }
-      await runInstantValidate(selectedMode);
-    });
-  }
+  // if (reuseButton) {
+  //   reuseButton.addEventListener('click', async () => {
+  //     const prompt = promptInput.value.trim();
+  //     lastUserPrompt = prompt;
+  //     if (!prompt) {
+  //       setStatus('Please enter a prompt or choose a preset', 'rgba(255,0,0,0.2)');
+  //       return;
+  //     }
+  //     clearResults();
+  //     setStatus('Using existing code...', 'rgba(255,255,255,0.1)');
+  //     // Initialize via /reuse generate
+  //     const genRes = await fetch('/instant-run', {
+  //       method: 'POST',
+  //       headers: { 'Content-Type': 'application/json' },
+  //       body: JSON.stringify({ mode: selectedMode, action: 'generate', prompt })
+  //     });
+  //     const genData = await genRes.json();
+  //     if (!genRes.ok) {
+  //       setStatus('Error: ' + (genData.error || 'Failed to initialize'), 'rgba(255,0,0,0.2)');
+  //       return;
+  //     }
+  //     // Show live feed always
+  //     const streamUrl = (genData.stream_url || '/video_feed') + `?t=${Date.now()}`;
+  //     liveImg.src = streamUrl;
+  //     liveContainer.style.display = 'block';
+  //     if (selectedMode === 'qr') {
+  //       const files = (genData.data && genData.data.qr_codes) ? genData.data.qr_codes : [];
+  //       if (files.length) { showQrImages(files); addVerifyButtonInstant(selectedMode); }
+  //       if (genData.data && genData.data.text) {
+  //         const p = document.createElement('p');
+  //         p.style.color = '#fff';
+  //         p.textContent = genData.data.text;
+  //         statusDiv.insertAdjacentElement('afterend', p);
+  //       }
+  //       setStatus('QR ready. Click Verify (Instant).', 'rgba(0,255,0,0.2)');
+  //       return;
+  //     }
+  //     await runInstantValidate(selectedMode);
+  //   });
+  // }
 
   // Preset registry UI
   async function loadPresets() {
@@ -585,9 +601,9 @@ function addVerifyButtonInstant(mode) {
             liveContainer.style.display = 'block';
             if (selectedMode === 'qr') {
               const files = (genData.data && genData.data.qr_codes) ? genData.data.qr_codes : [];
-              if (files.length) { showQrImages(files); addVerifyButtonInstant(selectedMode); }
+              if (files.length) { showQrImages(files); addVerifyButtonInstant(selectedMode, genData.data.script_name); }
             }
-            await runInstantValidate(selectedMode);
+            await runInstantValidate(selectedMode, genData.data.script_name);
           };
           row.appendChild(label);
           row.appendChild(btn);
@@ -613,6 +629,9 @@ function addVerifyButtonInstant(mode) {
       liveImg.src = '';
       clearResults();
 
+      // Toggle instant run button for QR mode
+      toggleInstantRunButton();
+
       // Toggle preset groups beneath buttons
       const gDiv = document.getElementById('gesture-presets');
       const oDiv = document.getElementById('object-presets');
@@ -628,6 +647,63 @@ function addVerifyButtonInstant(mode) {
       }
     });
   });
+  // Initialize Instant Run button visibility on first load
+  toggleInstantRunButton();
+  if (instantRunButton) {
+    instantRunButton.addEventListener('click', async () => {
+      try {
+        clearResults();
+        setStatus('Using existing QR code...', 'rgba(255,255,255,0.1)');
+
+        // Try to fetch the preferred QR generator script from the registry
+        let scriptName = null;
+        try {
+          const p = await fetch('/presets', { cache: 'no-store' });
+          const reg = await p.json();
+          if (reg && reg.qr && reg.qr.qr_generate) {
+            scriptName = reg.qr.qr_generate;
+          }
+        } catch(e) { /* ignore registry errors */ }
+
+        // Call /instant-run generate for QR
+        const genRes = await fetch('/instant-run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            mode: 'qr',
+            action: 'generate',
+            scriptName: scriptName
+          })
+        });
+        const genData = await genRes.json();
+        if (!genRes.ok) {
+          setStatus('Error: ' + (genData.error || 'Failed to initialize QR'), 'rgba(255,0,0,0.2)');
+          return;
+        }
+
+        // Show live feed
+        const streamUrl = (genData.stream_url || '/video_feed') + `?t=${Date.now()}`;
+        liveImg.src = streamUrl;
+        liveContainer.style.display = 'block';
+
+        // Render QR
+        const files = (genData.data && genData.data.qr_codes) ? genData.data.qr_codes : [];
+        if (files.length) {
+          showQrImages(files);
+          addVerifyButtonInstant('qr', genData.data.script_name);
+        }
+        if (genData.data && genData.data.text) {
+          const p = document.createElement('p');
+          p.style.color = '#fff';
+          p.textContent = genData.data.text;
+          statusDiv.insertAdjacentElement('afterend', p);
+        }
+        setStatus('QR ready. Click Verify (Instant).', 'rgba(0,255,0,0.2)');
+      } catch (e) {
+        setStatus('Error: ' + e.message, 'rgba(255,0,0,0.2)');
+      }
+    });
+  }
 
   // -------------------- Actions --------------------
   async function runGenerate() {
@@ -678,6 +754,7 @@ function addVerifyButtonInstant(mode) {
           statusDiv.insertAdjacentElement('afterend', p);
         }
         setStatus('QR ready. Click Verify when ready.', 'rgba(0,255,0,0.2)');
+        toggleInstantRunButton();
       } else if (selectedMode === 'gesture' || selectedMode === 'object') {
         setStatus('Preparing detector...', 'rgba(255,255,255,0.1)');
         await runValidate(selectedMode, prompt);
@@ -689,6 +766,7 @@ function addVerifyButtonInstant(mode) {
     } finally {
       runButton.disabled = false;
       if (reuseButton) reuseButton.disabled = false;
+      toggleInstantRunButton();
       spinner.style.display = 'none';
     }
   }
@@ -756,12 +834,12 @@ function addVerifyButtonInstant(mode) {
               } else if (s.phase === 'done') {
                 const verified = (s.data && typeof s.data.verified !== 'undefined') ? s.data.verified : (s.verified || false);
                 if (verified) {
-                  setStatus('Verified!', 'rgba(0, 255, 0, 0.2)');
+                  setStatus('Verified!', 'rgba(0,255,0,0.25)');
                 } else {
-                  setStatus('Completed. No verification.', 'rgba(255, 255, 255, 0.1)');
+                  setStatus('Verification failed.', 'rgba(255,0,0,0.25)');
                 }
               } else {
-                setStatus('Detected!', 'rgba(0, 255, 0, 0.2)');
+                setStatus('Detected!', 'rgba(0,255,0,0.2)');
               }
             }
           } catch (err) {

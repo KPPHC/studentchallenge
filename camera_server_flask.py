@@ -15,7 +15,21 @@ import threading
 import time
 from datetime import datetime
 
+
+app = Flask(__name__)
+register_camera_routes(app)
+
+HOST = "0.0.0.0"
+PORT = 8080
+
 REGISTRY_PATH = os.path.join(os.getcwd(), "runners_registry.json")
+JOBS_DIR = os.path.join(os.getcwd(), "jobs")
+os.makedirs(JOBS_DIR, exist_ok=True)
+
+
+SESSIONS = {}  # {session_id: {"mode": "gesture"|"object", "video_path": str|None}}
+UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # Registry helpers
 def _load_registry() -> Dict[str, Dict[str, str]]:
@@ -37,6 +51,17 @@ def _save_registry(reg: Dict[str, Dict[str, str]]):
             json.dump(reg, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+def _filter_result_fields(mode: str, data: dict) -> dict:
+    allowed = {
+        'qr': {'expected_uuid', 'uuid', 'verified'},
+        'gesture': {'confidence', 'gesture', 'verified'},
+        'object': {'confidence', 'object', 'verified'},
+    }
+    if not isinstance(data, dict):
+        return {}
+    keys = allowed.get(mode, set())
+    return {k: v for k, v in data.items() if k in keys}
 
 def _slugify(name: str) -> str:
     s = re.sub(r"[^A-Za-z0-9]+", "_", name.strip().lower()).strip("_")
@@ -65,21 +90,6 @@ def _register_runner(mode: str, display_name: str, source_script: Optional[str])
     reg[mode][display_name] = os.path.basename(target)
     _save_registry(reg)
     return target
-
-
-app = Flask(__name__)
-register_camera_routes(app)
-
-HOST = "0.0.0.0"
-PORT = 8080
-
-JOBS_DIR = os.path.join(os.getcwd(), "jobs")
-os.makedirs(JOBS_DIR, exist_ok=True)
-
-
-SESSIONS = {}  # {session_id: {"mode": "gesture"|"object", "video_path": str|None}}
-UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ---- Helpers ---------------------------------------------------------------
 def _list_recent_qr_images() -> List[str]:
@@ -116,6 +126,7 @@ def _job_dir(job_id: str) -> str:
     os.makedirs(d, exist_ok=True)
     return d
 
+
 def _write_json(path: str, payload: Dict[str, Any]):
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -123,15 +134,127 @@ def _write_json(path: str, payload: Dict[str, Any]):
     except Exception:
         pass
 
+# --- Canonical output file per mode
+def _canonical_result_file(mode: str) -> str:
+    mapping = {'qr': 'uuid.json', 'gesture': 'gesture_output.json', 'object': 'object_output.json'}
+    return mapping.get(mode, 'output.json')
+
+
+# --- Background watcher for QR validation
+def _start_qr_watcher(job_id: str, timeout_sec: int = 30):
+    """Background watcher for QR: waits for uuid.json, compares to reference_uuid.json,
+    then updates jobs/<job_id>/status.json with detected/done and verified.
+    """
+    def _watch():
+        d = _job_dir(job_id)
+        status_path = os.path.join(d, 'status.json')
+        script_status_path = os.path.join(d, 'script_status.json')
+        result_path_job = os.path.join(d, _canonical_result_file('qr'))      # prefer job-local uuid.json
+        result_path_cwd = os.path.join(os.getcwd(), _canonical_result_file('qr'))  # fallback to CWD
+        start_ts = time.time()
+        deadline = start_ts + timeout_sec
+        published_detected = False
+        while time.time() < deadline:
+            # If the script already finalized, stop.
+            try:
+                if os.path.exists(script_status_path):
+                    with open(script_status_path, 'r', encoding='utf-8') as f:
+                        s = json.load(f) or {}
+                        if s.get('phase') in ('done', 'error'):
+                            return
+                        if s.get('phase') == 'detected':
+                            published_detected = True
+            except Exception:
+                pass
+            # Prefer job-local result; fall back to CWD
+            candidate = result_path_job if os.path.exists(result_path_job) else (result_path_cwd if os.path.exists(result_path_cwd) else None)
+            if candidate:
+                try:
+                    mtime = os.path.getmtime(candidate)
+                    if mtime < start_ts:
+                        # stale file from previous run; ignore until it is updated
+                        raise RuntimeError('stale uuid.json (mtime < start_ts)')
+                    # basic stability check: wait a short moment to avoid partial writes
+                    size1 = os.path.getsize(candidate)
+                    time.sleep(0.1)
+                    size2 = os.path.getsize(candidate)
+                    if size2 != size1:
+                        # still being written; skip this iteration
+                        raise RuntimeError('uuid.json still growing')
+
+                    detected = ''
+                    with open(candidate, 'r', encoding='utf-8') as f:
+                        out = json.load(f) or {}
+                        detected = (out.get('uuid') or '').strip()
+                    expected = ''
+                    try:
+                        ref_job = os.path.join(d, 'reference_uuid.json')
+                        if os.path.exists(ref_job):
+                            with open(ref_job, 'r', encoding='utf-8') as rf:
+                                ref = json.load(rf) or {}
+                                expected = (ref.get('uuid') or '').strip()
+                        elif os.path.exists('reference_uuid.json'):
+                            with open('reference_uuid.json', 'r', encoding='utf-8') as rf:
+                                ref = json.load(rf) or {}
+                                expected = (ref.get('uuid') or '').strip()
+                    except Exception:
+                        expected = ''
+                    verified = bool(expected) and bool(detected) and (expected == detected)
+                    # If the script already marked DONE, we'll finalize immediately. Otherwise, proceed with our own finalize.
+                    try:
+                        if os.path.exists(script_status_path):
+                            with open(script_status_path, 'r', encoding='utf-8') as f:
+                                s2 = json.load(f) or {}
+                                if s2.get('phase') == 'done':
+                                    published_detected = True
+                    except Exception:
+                        pass
+                    # write detected first (if not yet)
+                    if not published_detected:
+                        _write_json(status_path, {"phase": "detected", "mode": "qr"})
+                        published_detected = True
+                    # then mark done with data
+                    cur = {}
+                    try:
+                        if os.path.exists(status_path):
+                            with open(status_path, 'r', encoding='utf-8') as f:
+                                cur = json.load(f) or {}
+                    except Exception:
+                        cur = {}
+                    cur['phase'] = 'done'
+                    cur['mode'] = 'qr'
+                    cur.setdefault('data', {})
+                    payload = {
+                        'uuid': detected,
+                        'expected_uuid': expected,
+                        'verified': verified
+                    }
+                    cur['data'].update(_filter_result_fields('qr', payload))
+                    _write_json(status_path, cur)
+                    return
+                except Exception:
+                    pass
+            time.sleep(0.5)
+        # timeout: if not finalized, mark error
+        try:
+            cur = {}
+            if os.path.exists(status_path):
+                with open(status_path, 'r', encoding='utf-8') as f:
+                    cur = json.load(f) or {}
+            if cur.get('phase') not in ('done', 'error'):
+                cur['phase'] = 'error'
+                cur['mode'] = 'qr'
+                cur['message'] = 'Timeout waiting for uuid.json'
+                _write_json(status_path, cur)
+        except Exception:
+            pass
+    t = threading.Thread(target=_watch, daemon=True)
+    t.start()
+
 def _read_job_status(job_id: str) -> Dict[str, Any]:
     d = _job_dir(job_id)
     status_path = os.path.join(d, "status.json")
     script_status_path = os.path.join(d, "script_status.json")
-    result_files = {
-        'qr': 'uuid.json',
-        'gesture': 'gesture_output.json',
-        'object': 'object_output.json'
-    }
     status = {"job_id": job_id, "phase": "queued", "updated_at": datetime.utcnow().isoformat() + "Z"}
     # status.json (written by background thread)
     try:
@@ -149,20 +272,62 @@ def _read_job_status(job_id: str) -> Dict[str, Any]:
                 status.update(s)
     except Exception:
         pass
-    # merge result json if present
-    for fname in result_files.values():
-        try:
-            p = os.path.join(os.getcwd(), fname)
-            if os.path.exists(p):
-                with open(p, "r", encoding="utf-8") as f:
-                    r = json.load(f) or {}
-                    if isinstance(r, dict):
-                        status.setdefault('data', {})
-                        for k, v in r.items():
-                            if k not in status['data']:
-                                status['data'][k] = v
-        except Exception:
-            pass
+    # merge only the canonical result json for this job's mode
+    try:
+        mode = status.get('mode') or request.args.get('mode') or 'qr'
+        result_path_job = os.path.join(d, _canonical_result_file(mode))
+        result_path_cwd = os.path.join(os.getcwd(), _canonical_result_file(mode))
+        chosen = result_path_job if os.path.exists(result_path_job) else (result_path_cwd if os.path.exists(result_path_cwd) else None)
+        if chosen:
+            with open(chosen, "r", encoding="utf-8") as f:
+                r = json.load(f) or {}
+                if isinstance(r, dict):
+                    status.setdefault('data', {})
+                    status['data'].update(_filter_result_fields(mode, r))
+    except Exception:
+        pass
+
+    # QR fallback: if we have uuid but missing expected/verified, compute them here (JOB_DIR first)
+    try:
+        mode_eff = status.get('mode') or request.args.get('mode') or 'qr'
+        if mode_eff == 'qr' and isinstance(status.get('data'), dict):
+            data = status['data']
+            has_uuid = isinstance(data.get('uuid'), str) and len(data.get('uuid')) > 0
+            needs_expected = 'expected_uuid' not in data
+            needs_verified = 'verified' not in data
+            if has_uuid and (needs_expected or needs_verified):
+                expected = ''
+                ref_job = os.path.join(d, 'reference_uuid.json')
+                if os.path.exists(ref_job):
+                    try:
+                        with open(ref_job, 'r', encoding='utf-8') as rf:
+                            ref = json.load(rf) or {}
+                            expected = (ref.get('uuid') or '').strip()
+                    except Exception:
+                        expected = ''
+                elif os.path.exists('reference_uuid.json'):
+                    try:
+                        with open('reference_uuid.json', 'r', encoding='utf-8') as rf:
+                            ref = json.load(rf) or {}
+                            expected = (ref.get('uuid') or '').strip()
+                    except Exception:
+                        expected = ''
+                if needs_expected:
+                    data['expected_uuid'] = expected
+                if needs_verified:
+                    data['verified'] = bool(expected) and (expected == data.get('uuid'))
+                # sanitize after adding
+                status['data'] = _filter_result_fields('qr', data)
+    except Exception:
+        pass
+
+    # sanitize any pre-existing data fields to the allowed set for this mode
+    try:
+        mode = status.get('mode') or request.args.get('mode') or 'qr'
+        if isinstance(status.get('data'), dict):
+            status['data'] = _filter_result_fields(mode, status['data'])
+    except Exception:
+        pass
     # Auto-register newly verified gesture/object into registry (idempotent)
     try:
         data = status.get('data') or {}
@@ -242,8 +407,9 @@ Before writing new code:
 - Only generate a new script if no suitable existing code is found. If you modify an existing file, keep its name.
 
 Requirements:
-- Create (or overwrite) a file named reference_uuid.json in the current working directory with JSON content: {\"uuid\": \"<GENERATED_UUID>\"}.
-- Create (or overwrite) a QR code image file named qr_image.jpeg (JPEG) that encodes exactly the same <GENERATED_UUID> string.
+- Create (or overwrite) a file named reference_uuid.json in the current working directory with JSON content: {"uuid": "<GENERATED_UUID>"}.
+- Additionally, IF the environment variable JOB_DIR is present, also write the same JSON to os.path.join(os.environ["JOB_DIR"], "reference_uuid.json") so that a per-job copy exists.
+- Create (or overwrite) a QR code image file named qr_image.jpeg (JPEG) that encodes exactly the same <GENERATED_UUID> string. IF JOB_DIR is present, optionally also copy/save the same image under os.path.join(os.environ["JOB_DIR"], "qr_image.jpeg").
 - Use Python. If libraries are missing, install them programmatically (e.g., qrcode[pil], pillow). Avoid reinstalling if already present.
 - On completion, print a single line to stdout in the exact format: qr_ready <GENERATED_UUID>
 
@@ -291,6 +457,7 @@ def instant_run():
       prompt?: str
     }
     """
+
     body = request.get_json(silent=True) or {}
     mode = body.get('mode', 'qr')
     action = body.get('action', 'generate')  # 'generate' or 'validate'
@@ -298,7 +465,35 @@ def instant_run():
     if action == 'generate':
         display_name = (body.get('displayName') or '').strip() or None
         script_name = (body.get('scriptName') or '').strip() or None
-        script_path = os.path.join(os.getcwd(), script_name)
+        script_path = os.path.join(os.getcwd(), script_name) if script_name else None
+
+        if mode == 'qr':
+            # For QR: run qr_generator.py if provided and exists; otherwise, generate UUID+QR here.
+            try:
+                uid = None
+                # Execute the generator script; expect it to create reference_uuid.json and qr_image.jpeg
+                proc = subprocess.run([sys.executable, script_path], capture_output=True, text=True)
+                # Best-effort read of reference_uuid.json
+                try:
+                    if os.path.exists('reference_uuid.json'):
+                        with open('reference_uuid.json', 'r', encoding='utf-8') as f:
+                            ref = json.load(f) or {}
+                            uid = ref.get('uuid')
+                except Exception:
+                    uid = None
+                if proc.returncode != 0 and not uid:
+                    # Fallback to in-process generation if script failed
+                    raise RuntimeError(proc.stderr or 'qr_generator failed')
+                return jsonify({
+                    'status': 'ok',
+                    'kind': 'qr',
+                    'data': {'qr_codes': _list_recent_qr_images(), 'script_name': "qr_runner.py"},
+                    'stream_url': '/video_feed'
+                }), 200
+            except Exception as e:
+                return jsonify({'status': 'error', 'message': f'QR instant-run generate failed: {e}'}), 500
+
+        # Non-QR (gesture/object): just return live stream info
         return jsonify({
             'status': 'ok',
             'kind': 'live',
@@ -308,16 +503,69 @@ def instant_run():
     else:
         display_name = (body.get('displayName') or '').strip() or None
         script_name = (body.get('scriptName') or '').strip() or None
-        script_path = os.path.join(os.getcwd(), script_name)
+        script_path = os.path.join(os.getcwd(), script_name) if script_name else None
+
+        if mode == 'qr':
+            job_id = str(uuid.uuid4())
+            d = _job_dir(job_id)
+            _write_json(os.path.join(d, 'status.json'), {
+                'phase': 'running',
+                'script': script_path,
+                'mode': mode,
+                'displayName': display_name,
+                'scriptName': os.path.basename(script_path) if script_path else None
+            })
+            # Touch READY immediately so UI can switch; the runner should later write detected/done
+            _write_json(os.path.join(d, 'script_status.json'), {'phase': 'ready'})
+            # Ensure reference_uuid.json is available in JOB_DIR for consistent comparison
+            try:
+                src_ref = 'reference_uuid.json'
+                dst_ref = os.path.join(d, 'reference_uuid.json')
+                if os.path.exists(src_ref):
+                    shutil.copyfile(src_ref, dst_ref)
+            except Exception:
+                pass
+            # start asynchronous watcher that will compare uuid.json vs reference_uuid.json
+            _start_qr_watcher(job_id, timeout_sec=30)
+            try:
+                proc_log_path = os.path.join(d, 'script.log')
+                proc_out = open(proc_log_path, 'w', encoding='utf-8')
+                env = os.environ.copy()
+                env['JOB_ID'] = job_id
+                env['JOB_DIR'] = d
+                proc = subprocess.Popen([sys.executable, "-u", script_path],
+                                        stdout=proc_out, stderr=subprocess.STDOUT, env=env)
+                stdout_text = proc.stdout or ''
+                stderr_text = proc.stderr or ''
+                run_ok = (proc.returncode == 0)
+            except subprocess.TimeoutExpired as e:
+                stdout_text = (getattr(e, 'stdout', '') or '')
+                stderr_text = (getattr(e, 'stderr', '') or '')
+                return jsonify({
+                    'status': 'error',
+                    'kind': 'qr-validate',
+                    'message': 'qr_runner timed out',
+                    'stdout': stdout_text[-4000:],
+                    'stderr': stderr_text[-4000:]
+                }), 504
+            except Exception as e:
+                return jsonify({
+                    'status': 'error',
+                    'kind': 'qr-validate',
+                    'message': f'Failed to start qr_runner: {e}'
+                }), 500
+
+            return jsonify({ 'status': 'accepted', 'job_id': job_id, 'poll_url': f'/job-status?job_id={job_id}' }), 202
+
+        # gesture/object: async run of the provided runner script
         job_id = str(uuid.uuid4())
-        print(job_id)
         d = _job_dir(job_id)
         _write_json(os.path.join(d, 'status.json'), {
             'phase': 'running',
             'script': script_path,
             'mode': mode,
             'displayName': display_name,
-            'scriptName': os.path.basename(script_path)
+            'scriptName': os.path.basename(script_path) if script_path else None
         })
         # Touch READY immediately so UI can switch; the runner should later write detected/done
         _write_json(os.path.join(d, 'script_status.json'), {'phase': 'ready'})
@@ -368,7 +616,7 @@ Before writing new code:
 
 Requirements:
 - When a QR is detected, print a single line to stdout in the exact format: qr_code <QR_CODE_CONTENT>
-- Save a JSON file named uuid.json in the current working directory with JSON content: {{\"uuid\": <QR_CODE_CONTENT>}}
+- Save a JSON file named uuid.json into os.path.join(os.environ.get("JOB_DIR","."), "uuid.json") with JSON content: {{\"uuid\": <QR_CODE_CONTENT>}}
 - Exit non-zero with a clear message on failure.
 - The script should stop after successful detection or after ~15 seconds.
 - Use Python. If dependencies (e.g., opencv-python, pyzbar, numpy, pillow) are missing, install them programmatically; skip install if already available.
@@ -451,10 +699,10 @@ ultrathink"""
       - qr     : {{"phase":"detected","uuid":"<VALUE>"}}
     And also print exactly one line to stdout (e.g., "gesture <NAME>", "object <CLASS>", "qr_code <VALUE>") with flush=True.
   * DONE / ERROR → on normal finish write {{"phase":"done","verified": <true|false>}}; on fatal error write {{"phase":"error","message":"..."}} and exit non-zero.
-- Canonical outputs (write to current working directory so the server can always pick them up):
-  - gesture → gesture_output.json   e.g., {{"gesture":"<NAME>","verified":true,"confidence":0.xx}}
-  - object  → object_output.json    e.g., {{"object":"<CLASS>","verified":true,"confidence":0.xx}}
-  - qr      → uuid.json             e.g., {{"uuid":"<VALUE>"}}
+- Canonical outputs (write under JOB_DIR so the server can always pick them up per job):
+  - gesture → os.path.join(JOB_DIR, 'gesture_output.json')   e.g., {{"gesture":"<NAME>","verified":true,"confidence":0.xx}}
+  - object  → os.path.join(JOB_DIR, 'object_output.json')    e.g., {{"object":"<CLASS>","verified":true,"confidence":0.xx}}
+  - qr      → os.path.join(JOB_DIR, 'uuid.json')             e.g., {{"uuid":"<VALUE>"}}
 - Parameterization for reuse:
   - Determine the target to detect in this order:
       1) os.environ.get("TARGET_NAME")      # highest priority
