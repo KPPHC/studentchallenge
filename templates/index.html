@@ -139,6 +139,30 @@
             100% { transform: rotate(360deg); }
         }
         
+        /* App title */
+        .app-title {
+            font-size: 42px;
+            font-weight: 800;
+            letter-spacing: 0.12em;
+            margin: 6px 0 10px;
+            text-transform: uppercase;
+            background: linear-gradient(90deg, #6cf, #7fffd4, #a892ff);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            text-shadow: 0 0 18px rgba(124, 252, 255, 0.15);
+        }
+        .app-subtitle {
+            font-size: 14px;
+            color: #aaa;
+            margin: -6px 0 8px;
+            letter-spacing: 0.08em;
+        }
+        @media (max-width: 480px) {
+            .app-title { font-size: 34px; }
+            .app-subtitle { font-size: 13px; }
+        }
+
         /* Small phones */
         @media (max-width: 480px) {
             .container {
@@ -195,8 +219,11 @@
 </head>
 <body>
     <div class="container">
-        
-        
+        <div class="title-wrap" style="text-align:center;">
+            <h1 class="app-title">FALCON</h1>
+            <!-- Optional subtitle: uncomment if you want a tagline -->
+            <!-- <div class="app-subtitle">Fast Adaptive Live Camera Object &amp; kNowledge</div> -->
+        </div>
         <div class="controls">
             <div class="presets" id="presets" style="display:flex;gap:0.5rem;flex-wrap:wrap;justify-content:center;width:100%;max-width:800px;">
               <button type="button" class="preset-btn" data-mode="qr" data-id="qr">QR-code</button>
@@ -237,18 +264,18 @@
     },
     gesture: {
       mode: 'gesture',
-      prompt: "I want to verify myself with a specific gesture. The gesture is 'thumb up'."
+      prompt: "I want to detect the moment when I make a specific gesture. The gesture is 'wave'."
     },
     object: {
       mode: 'object',
-      prompt: "I want to verify myself with a specific object. The object is 'apple'."
+      prompt: "I want to detect the moment when I show a specific object. The object is 'apple'."
     }
   };
 
   const liveContainer = document.getElementById('live-container');
   const liveImg = document.getElementById('live-video');
 
-  let selectedMode = 'qr';
+  let selectedMode = null;
   let currentSessionId = null;
   let lastUserPrompt = '';
   const reuseButton = document.getElementById('reuseButton');
@@ -490,47 +517,6 @@ function addVerifyButtonInstant(mode, script_name=null) {
       setStatus('Error: ' + e.message, 'rgba(255,0,0,0.2)');
     }
   }
-
-  // if (reuseButton) {
-  //   reuseButton.addEventListener('click', async () => {
-  //     const prompt = promptInput.value.trim();
-  //     lastUserPrompt = prompt;
-  //     if (!prompt) {
-  //       setStatus('Please enter a prompt or choose a preset', 'rgba(255,0,0,0.2)');
-  //       return;
-  //     }
-  //     clearResults();
-  //     setStatus('Using existing code...', 'rgba(255,255,255,0.1)');
-  //     // Initialize via /reuse generate
-  //     const genRes = await fetch('/instant-run', {
-  //       method: 'POST',
-  //       headers: { 'Content-Type': 'application/json' },
-  //       body: JSON.stringify({ mode: selectedMode, action: 'generate', prompt })
-  //     });
-  //     const genData = await genRes.json();
-  //     if (!genRes.ok) {
-  //       setStatus('Error: ' + (genData.error || 'Failed to initialize'), 'rgba(255,0,0,0.2)');
-  //       return;
-  //     }
-  //     // Show live feed always
-  //     const streamUrl = (genData.stream_url || '/video_feed') + `?t=${Date.now()}`;
-  //     liveImg.src = streamUrl;
-  //     liveContainer.style.display = 'block';
-  //     if (selectedMode === 'qr') {
-  //       const files = (genData.data && genData.data.qr_codes) ? genData.data.qr_codes : [];
-  //       if (files.length) { showQrImages(files); addVerifyButtonInstant(selectedMode); }
-  //       if (genData.data && genData.data.text) {
-  //         const p = document.createElement('p');
-  //         p.style.color = '#fff';
-  //         p.textContent = genData.data.text;
-  //         statusDiv.insertAdjacentElement('afterend', p);
-  //       }
-  //       setStatus('QR ready. Click Verify (Instant).', 'rgba(0,255,0,0.2)');
-  //       return;
-  //     }
-  //     await runInstantValidate(selectedMode);
-  //   });
-  // }
 
   // Preset registry UI
   async function loadPresets() {

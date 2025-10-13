@@ -1,7 +1,6 @@
 import os
 import shutil
 import subprocess
-import base64
 import sys
 import uuid
 import json
@@ -9,7 +8,6 @@ from flask import Flask, request, send_file, render_template, jsonify
 from pathlib import Path
 import re
 from typing import Dict, Any, List, Optional
-from werkzeug.utils import secure_filename
 from camera import register_camera_routes
 import threading
 import time
@@ -27,9 +25,6 @@ JOBS_DIR = os.path.join(os.getcwd(), "jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
 
 
-SESSIONS = {}  # {session_id: {"mode": "gesture"|"object", "video_path": str|None}}
-UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # Registry helpers
 def _load_registry() -> Dict[str, Dict[str, str]]:
@@ -54,9 +49,9 @@ def _save_registry(reg: Dict[str, Dict[str, str]]):
 
 def _filter_result_fields(mode: str, data: dict) -> dict:
     allowed = {
-        'qr': {'expected_uuid', 'uuid', 'verified'},
-        'gesture': {'confidence', 'gesture', 'verified'},
-        'object': {'confidence', 'object', 'verified'},
+        'qr': {'expected_uuid', 'uuid', 'verified', 'timestamp'},
+        'gesture': {'confidence', 'gesture', 'verified', 'timestamp'},
+        'object': {'confidence', 'object', 'verified', 'timestamp'},
     }
     if not isinstance(data, dict):
         return {}
@@ -224,10 +219,12 @@ def _start_qr_watcher(job_id: str, timeout_sec: int = 30):
                     cur['phase'] = 'done'
                     cur['mode'] = 'qr'
                     cur.setdefault('data', {})
+                    ts_iso = datetime.utcfromtimestamp(mtime).isoformat() + "Z"
                     payload = {
                         'uuid': detected,
                         'expected_uuid': expected,
-                        'verified': verified
+                        'verified': verified,
+                        'timestamp': ts_iso
                     }
                     cur['data'].update(_filter_result_fields('qr', payload))
                     _write_json(status_path, cur)
@@ -316,6 +313,15 @@ def _read_job_status(job_id: str) -> Dict[str, Any]:
                     data['expected_uuid'] = expected
                 if needs_verified:
                     data['verified'] = bool(expected) and (expected == data.get('uuid'))
+                if 'timestamp' not in data:
+                    # infer timestamp from the job-local uuid.json mtime if available
+                    try:
+                        rp_job = os.path.join(d, _canonical_result_file('qr'))
+                        if os.path.exists(rp_job):
+                            mt = os.path.getmtime(rp_job)
+                            data['timestamp'] = datetime.utcfromtimestamp(mt).isoformat() + 'Z'
+                    except Exception:
+                        pass
                 # sanitize after adding
                 status['data'] = _filter_result_fields('qr', data)
     except Exception:
@@ -383,9 +389,18 @@ def index():
 @app.route('/qr-code/<filename>')
 def serve_qr_code(filename):
     """Serve QR code image file."""
-    if not os.path.exists(filename):
+    # Only allow files in the current working directory with safe extensions
+    safe_exts = {'.png', '.jpg', '.jpeg'}
+    name = os.path.basename(filename)
+    if name != filename:
+        return "Invalid filename", 400
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in safe_exts:
+        return "Unsupported file type", 400
+    path = os.path.join(os.getcwd(), name)
+    if not os.path.exists(path):
         return "QR code not found", 404
-    return send_file(filename, mimetype='image/png')
+    return send_file(path)
 
 @app.route('/generate', methods=['POST'])
 def generate():
@@ -407,7 +422,7 @@ Before writing new code:
 - Only generate a new script if no suitable existing code is found. If you modify an existing file, keep its name.
 
 Requirements:
-- Create (or overwrite) a file named reference_uuid.json in the current working directory with JSON content: {"uuid": "<GENERATED_UUID>"}.
+- Create (or overwrite) a file named reference_uuid.json in the current working directory with JSON content: {"uuid": "<GENERATED_UUID>", "timestamp": "<ISO8601 UTC>"}.
 - Additionally, IF the environment variable JOB_DIR is present, also write the same JSON to os.path.join(os.environ["JOB_DIR"], "reference_uuid.json") so that a per-job copy exists.
 - Create (or overwrite) a QR code image file named qr_image.jpeg (JPEG) that encodes exactly the same <GENERATED_UUID> string. IF JOB_DIR is present, optionally also copy/save the same image under os.path.join(os.environ["JOB_DIR"], "qr_image.jpeg").
 - Use Python. If libraries are missing, install them programmatically (e.g., qrcode[pil], pillow). Avoid reinstalling if already present.
@@ -420,17 +435,7 @@ ultrathink"""
 
         # After Claude runs, enumerate QR images and read the reference UUID if present
         qr_files = _list_recent_qr_images()
-        uuid_text = None
-        try:
-            if os.path.exists("reference_uuid.json"):
-                with open("reference_uuid.json", "r", encoding="utf-8") as f:
-                    ref = json.load(f) or {}
-                    uuid_text = ref.get("uuid")
-        except Exception:
-            uuid_text = None
-
         data = {"qr_codes": qr_files}
-
         return _json_response('qr', result, data, session_id=claude_session_id)
 
     elif mode in ('gesture', 'object'):
@@ -533,21 +538,8 @@ def instant_run():
                 env = os.environ.copy()
                 env['JOB_ID'] = job_id
                 env['JOB_DIR'] = d
-                proc = subprocess.Popen([sys.executable, "-u", script_path],
-                                        stdout=proc_out, stderr=subprocess.STDOUT, env=env)
-                stdout_text = proc.stdout or ''
-                stderr_text = proc.stderr or ''
-                run_ok = (proc.returncode == 0)
-            except subprocess.TimeoutExpired as e:
-                stdout_text = (getattr(e, 'stdout', '') or '')
-                stderr_text = (getattr(e, 'stderr', '') or '')
-                return jsonify({
-                    'status': 'error',
-                    'kind': 'qr-validate',
-                    'message': 'qr_runner timed out',
-                    'stdout': stdout_text[-4000:],
-                    'stderr': stderr_text[-4000:]
-                }), 504
+                subprocess.Popen([sys.executable, "-u", script_path],
+                                 stdout=proc_out, stderr=subprocess.STDOUT, env=env)
             except Exception as e:
                 return jsonify({
                     'status': 'error',
@@ -616,7 +608,7 @@ Before writing new code:
 
 Requirements:
 - When a QR is detected, print a single line to stdout in the exact format: qr_code <QR_CODE_CONTENT>
-- Save a JSON file named uuid.json into os.path.join(os.environ.get("JOB_DIR","."), "uuid.json") with JSON content: {{\"uuid\": <QR_CODE_CONTENT>}}
+- Save a JSON file named uuid.json into os.path.join(os.environ.get("JOB_DIR","."), "uuid.json") with JSON content: {{\"uuid\": <QR_CODE_CONTENT>, \"timestamp\": \"<ISO8601 UTC>\"}}
 - Exit non-zero with a clear message on failure.
 - The script should stop after successful detection or after ~15 seconds.
 - Use Python. If dependencies (e.g., opencv-python, pyzbar, numpy, pillow) are missing, install them programmatically; skip install if already available.
@@ -638,7 +630,7 @@ The script must:
 - Open the default webcam and process frames continuously.
 - Implement the gesture logic based on the user's prompt (e.g., hand landmarks configuration). Make the condition parametrizable so it can adapt to different gestures; avoid hardcoding a specific gesture name.
 - When the specified gesture is detected, print exactly one line: gesture <GESTURE_NAME>
-- Save a JSON file named gesture_output.json containing at least: {{\"gesture\": \"<GESTURE_NAME>\", \"verified\": true, \"confidence\": <float between 0 and 1>}}
+- Save a JSON file named gesture_output.json containing at least: {{\"gesture\": \"<GESTURE_NAME>\", \"verified\": true, \"confidence\": <float between 0 and 1>, \"timestamp\": \"<ISO8601 UTC>\"}} into os.path.join(os.environ.get("JOB_DIR","."), "gesture_output.json")
 - Continue running for up to 20 seconds or until detection occurs; then exit.
 - Be resilient to missing webcam / install errors by printing a clear error and exiting non-zero.
 
@@ -661,7 +653,7 @@ The script must:
 - Open the default webcam and run inference on frames in real time.
 - Track the highest-confidence class observed over a short sliding window (e.g., ~30 frames) and implement class matching per the user prompt.
 - When confidence for a class exceeds 0.6 for at least 3 frames and matches the user-specified target, print exactly one line: object <CLASS_NAME>
-- Save a JSON file named object_output.json containing at least: {{\"object\": \"<CLASS_NAME>\", \"verified\": true, \"confidence\": <float between 0 and 1>}}
+- Save a JSON file named object_output.json containing at least: {{\"object\": \"<CLASS_NAME>\", \"verified\": true, \"confidence\": <float between 0 and 1>, \"timestamp\": \"<ISO8601 UTC>\"}} into os.path.join(os.environ.get("JOB_DIR","."), "object_output.json")
 - Continue for up to 20 seconds or until detection occurs; then exit.
 - Be resilient to missing webcam / install errors by printing a clear error and exiting non-zero.
 
@@ -694,15 +686,15 @@ ultrathink"""
       - print("PHASE READY", flush=True)
       - write {{"phase":"ready"}}
   * DETECTED → on successful detection, write one of:
-      - gesture: {{"phase":"detected","gesture":"<NAME>","confidence": <0..1>}}
-      - object : {{"phase":"detected","object":"<CLASS>","confidence": <0..1>}}
-      - qr     : {{"phase":"detected","uuid":"<VALUE>"}}
+      - gesture: {{"phase":"detected","gesture":"<NAME>","confidence": <0..1>, "timestamp":"<ISO8601Z>"}}
+      - object : {{"phase":"detected","object":"<CLASS>","confidence": <0..1>, "timestamp":"<ISO8601Z>"}}
+      - qr     : {{"phase":"detected","uuid":"<VALUE>", "timestamp":"<ISO8601Z>"}}
     And also print exactly one line to stdout (e.g., "gesture <NAME>", "object <CLASS>", "qr_code <VALUE>") with flush=True.
   * DONE / ERROR → on normal finish write {{"phase":"done","verified": <true|false>}}; on fatal error write {{"phase":"error","message":"..."}} and exit non-zero.
 - Canonical outputs (write under JOB_DIR so the server can always pick them up per job):
-  - gesture → os.path.join(JOB_DIR, 'gesture_output.json')   e.g., {{"gesture":"<NAME>","verified":true,"confidence":0.xx}}
-  - object  → os.path.join(JOB_DIR, 'object_output.json')    e.g., {{"object":"<CLASS>","verified":true,"confidence":0.xx}}
-  - qr      → os.path.join(JOB_DIR, 'uuid.json')             e.g., {{"uuid":"<VALUE>"}}
+  - gesture → os.path.join(JOB_DIR, 'gesture_output.json')   e.g., {{"gesture":"<NAME>","verified":true,"confidence":0.xx,"timestamp":"<ISO8601Z>"}}
+  - object  → os.path.join(JOB_DIR, 'object_output.json')    e.g., {{"object":"<CLASS>","verified":true,"confidence":0.xx,"timestamp":"<ISO8601Z>"}}
+  - qr      → os.path.join(JOB_DIR, 'uuid.json')             e.g., {{"uuid":"<VALUE>","timestamp":"<ISO8601Z>"}}
 - Parameterization for reuse:
   - Determine the target to detect in this order:
       1) os.environ.get("TARGET_NAME")      # highest priority
@@ -725,9 +717,9 @@ ultrathink"""
     }), 202
 
 @app.route('/recognize-qr-image', methods=['GET'])
-def recognize_qr_image():#
-    # Deprecated alias → forwards to /validate (qr mode)
-    with app.test_request_context('/validate?mode=qr'):
+def recognize_qr_image():
+    # Deprecated alias → forwards to /validate (qr mode) using POST
+    with app.test_request_context('/validate?mode=qr', method='POST', json={}):
         return validate()
 
 @app.route('/job-status', methods=['GET'])
@@ -751,6 +743,8 @@ def run_claude(prompt: str, cwd: str = ".", session_id=None):
     Returns a tuple: (stdout_text, session_id_str or None)
     """
     exe = shutil.which("claude")
+    if not exe:
+        return "Error: Claude CLI not found. Please install the 'claude' CLI or adjust configuration.", None
     args = [exe, "--output-format", "json"]
     if session_id:
         args += ["-r", session_id]
